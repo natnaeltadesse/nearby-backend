@@ -1,0 +1,24 @@
+# secrets / local config
+.env
+.env.local
+*.pem
+
+# build output
+bin/
+tmp/
+out/
+dist/
+*.exe
+
+# go
+vendor/
+*.test
+*.out
+coverage.*
+
+# editors / os
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp

@@ -1,0 +1,14 @@
+# oapi-codegen is used for models only, not for server stubs.
+#
+# The four surfaces have four different middleware chains, and the generated
+# chi server binds one router per spec — which would either flatten that split
+# or force four spec files that drift apart. Handlers are therefore hand-written
+# in internal/http/{public,customer,provider,admin}, and this generates the
+# request and response types they marshal, so the contract stays the source of
+# truth for the wire format.
+package: apitypes
+output: internal/apitypes/types.gen.go
+generate:
+  models: true
+output-options:
+  skip-prune: false

@@ -1,0 +1,52 @@
+name: booking
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: booking-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-booking}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-booking}
+      POSTGRES_DB: ${POSTGRES_DB:-booking}
+    ports:
+      # 5433 on the host: a second Postgres already owns 5432.
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - booking_pgdata:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/00-init-db.sql:ro
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-booking} -d ${POSTGRES_DB:-booking}"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # Only started by `make up-all` (docker compose --profile api).
+  # `make dev` runs the API on the host against this Postgres instead.
+  api:
+    build:
+      context: .
+      target: dev
+    container_name: booking-api
+    restart: unless-stopped
+    profiles: ["api"]
+    env_file: .env
+    environment:
+      # Inside the compose network Postgres is reachable by service name on 5432,
+      # so the host-facing DATABASE_URL from .env has to be overridden here.
+      DATABASE_URL: postgres://${POSTGRES_USER:-booking}:${POSTGRES_PASSWORD:-booking}@postgres:5432/${POSTGRES_DB:-booking}?sslmode=disable
+      HTTP_PORT: 8081
+    ports:
+      - "${HTTP_PORT:-8081}:8081"
+    volumes:
+      - .:/app
+      - go_mod_cache:/go/pkg/mod
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  booking_pgdata:
+  go_mod_cache:

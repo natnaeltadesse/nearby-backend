@@ -1,0 +1,2387 @@
+openapi: 3.0.3
+
+info:
+  title: Booking Platform API
+  version: 1.0.0
+  description: |
+    Multi-category service reservation platform.
+
+    Four surfaces, four different middleware chains:
+
+    | Prefix              | Requires                                       |
+    |---------------------|------------------------------------------------|
+    | `/api/v1/public`    | nothing (an optional bearer token personalizes) |
+    | `/api/v1/me`        | a bearer token, scoped by its `sub`             |
+    | `/api/v1/org`       | a bearer token **and** `x-organization-id`      |
+    | `/api/v1/admin`     | a bearer token whose `platformRole` is `admin`  |
+
+    **Conventions**
+
+    - Money is always an integer in minor units (`priceCents`); 24500 = 245.00 ETB.
+    - Times are always RFC3339 **UTC** on the wire.
+    - Times of day (opening hours) are `"HH:MM"` strings in the provider's zone.
+    - Errors are always `{ "message": string, "code": string }`.
+
+    **Versioning.** Once the mobile app ships, `/api/v1` is additive-only:
+    new optional fields are fine; removing, renaming, retyping a field or
+    tightening validation is not.
+
+    **Not yet implemented** (build order milestones 8-11): provider discovery
+    search, media uploads, reviews, favourites, notifications and payments.
+
+servers:
+  - url: http://localhost:8081
+    description: Local development
+
+tags:
+  - name: auth
+    description: Sign-up, sign-in and session lifecycle. No surface of its own.
+  - name: public
+    description: Unauthenticated reads across every tenant.
+  - name: me
+    description: The signed-in customer's own data.
+  - name: org
+    description: Provider staff acting within one verified organization.
+  - name: admin
+    description: Platform administrators acting across all tenants.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      tags: [public]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: The process is running.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /readyz:
+    get:
+      tags: [public]
+      summary: Readiness probe
+      description: Reports whether the database is reachable.
+      security: []
+      responses:
+        "200":
+          description: Ready to serve traffic.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ready }
+        "503":
+          $ref: "#/components/responses/Error"
+
+  # ---------------------------------------------------------------- auth
+  /api/v1/auth/sign-up:
+    post:
+      tags: [auth]
+      summary: Create a customer account
+      description: |
+        Every account starts as a customer with an empty `memberships` list.
+        Becoming provider staff happens by registering a business
+        (`POST /api/v1/me/providers`) or accepting an invitation.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SignUpRequest" }
+      responses:
+        "201":
+          description: Account created and signed in.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "409":
+          description: "`EMAIL_TAKEN`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /api/v1/auth/sign-in:
+    post:
+      tags: [auth]
+      summary: Exchange credentials for tokens
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SignInRequest" }
+      responses:
+        "200":
+          description: Signed in.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401":
+          description: "`INVALID_CREDENTIALS`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Rotate a refresh token
+      description: |
+        Refresh tokens are opaque, single-use and rotated on every call.
+        Presenting one that has already been used is treated as theft and
+        revokes every token the user holds.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "200":
+          description: A new token pair.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401":
+          description: "`INVALID_TOKEN` or `TOKEN_EXPIRED`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/auth/sign-out:
+    post:
+      tags: [auth]
+      summary: Revoke one refresh token
+      description: Idempotent; signing out twice is not an error.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "204": { description: Signed out. }
+
+  /api/v1/auth/sign-out-everywhere:
+    post:
+      tags: [auth]
+      summary: Revoke every refresh token the caller holds
+      responses:
+        "204": { description: Signed out on all devices. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+
+  /api/v1/auth/session:
+    get:
+      tags: [auth]
+      summary: Re-read the caller's account and memberships
+      description: |
+        Reads through to the database rather than echoing the token's claims,
+        so a membership granted or revoked since the token was issued shows up
+        immediately.
+      responses:
+        "200":
+          description: The current session.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user, memberships]
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+                  memberships:
+                    type: array
+                    items: { $ref: "#/components/schemas/Membership" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+
+  # ---------------------------------------------------------------- public
+  /api/v1/public/categories:
+    get:
+      tags: [public]
+      summary: List active categories
+      security: []
+      responses:
+        "200":
+          description: Active categories, ordered for display.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  categories:
+                    type: array
+                    items: { $ref: "#/components/schemas/Category" }
+
+  /api/v1/public/categories/{categoryId}/attributes:
+    get:
+      tags: [public]
+      summary: List a category's attribute definitions
+      description: |
+        Drives the dynamic forms on both clients. Adding a vertical with its own
+        fields is an insert by a platform admin — no migration, no app release.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/CategoryId"
+        - name: appliesTo
+          in: query
+          description: Narrow to one scope. Absent returns all three.
+          schema:
+            type: string
+            enum: [service, booking, provider]
+      responses:
+        "200":
+          description: The definitions, in display order.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  attributes:
+                    type: array
+                    items: { $ref: "#/components/schemas/Attribute" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/public/providers/{slug}:
+    get:
+      tags: [public]
+      summary: Get an active provider by slug
+      description: Providers that are not `active` are reported as not found.
+      security: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+          example: shine-wash
+      responses:
+        "200":
+          description: The provider.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/public/providers/{providerId}/services:
+    get:
+      tags: [public]
+      summary: List a provider's active services
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ProviderId"
+      responses:
+        "200":
+          description: Active services.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  services:
+                    type: array
+                    items: { $ref: "#/components/schemas/Service" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/public/services/{serviceId}:
+    get:
+      tags: [public]
+      summary: Get a service with its option groups
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ServiceId"
+      responses:
+        "200":
+          description: The service, including the add-ons the client renders.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Service" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/public/services/{serviceId}/availability:
+    get:
+      tags: [public]
+      summary: Bookable start times for one day
+      description: |
+        Returns start times only. The client sends a start back to
+        `POST /api/v1/me/bookings`, where the server re-derives the duration and
+        resource and lets a database exclusion constraint arbitrate — so a stale
+        slot list can cost a retry but never cause a double booking.
+
+        `optionIds` matters: add-ons change the duration, so a 45-minute wash
+        with wax needs a 65-minute hole.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ServiceId"
+        - name: date
+          in: query
+          required: true
+          description: Local calendar date in the provider's timezone.
+          schema: { type: string, format: date }
+          example: "2026-08-20"
+        - name: optionIds
+          in: query
+          description: Comma-separated option ids. Required groups must be satisfied.
+          schema: { type: string }
+      responses:
+        "200":
+          description: The day's free starts, ascending.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [date, slots]
+                properties:
+                  date: { type: string, format: date }
+                  slots:
+                    type: array
+                    items: { $ref: "#/components/schemas/Slot" }
+        "422":
+          description: "`VALIDATION_ERROR`, `SERVICE_INACTIVE` or `PROVIDER_INACTIVE`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ---------------------------------------------------------------- me
+  /api/v1/me/profile:
+    get:
+      tags: [me]
+      summary: Get the caller's profile and memberships
+      responses:
+        "200":
+          description: The caller.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+                  memberships:
+                    type: array
+                    items: { $ref: "#/components/schemas/Membership" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+    patch:
+      tags: [me]
+      summary: Update the caller's profile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                phone: { type: string, nullable: true }
+      responses:
+        "200":
+          description: The updated account.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/v1/me/bookings:
+    get:
+      tags: [me]
+      summary: List the caller's bookings
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/BookingStatus" }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: The caller's bookings, newest first.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Page"
+                  - type: object
+                    properties:
+                      bookings:
+                        type: array
+                        items: { $ref: "#/components/schemas/Booking" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+    post:
+      tags: [me]
+      summary: Reserve a slot
+      description: |
+        The request carries no price, duration or end time. The server recomputes
+        every number from the catalog, so client-sent totals are structurally
+        impossible rather than merely ignored.
+
+        Two customers taking the same slot both reach the INSERT; one wins and
+        the other receives `409 SLOT_TAKEN`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateBookingRequest" }
+      responses:
+        "201":
+          description: |
+            Reserved. `confirmed` for an `instant` provider, `pending` for a
+            `request` one.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Booking" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "409":
+          description: "`SLOT_TAKEN` — every eligible resource was taken."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: |
+            `VALIDATION_ERROR` (bad attributes or options), `OUTSIDE_HOURS`
+            (not a bookable start), `SERVICE_INACTIVE` or `PROVIDER_INACTIVE`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/me/bookings/{bookingId}:
+    get:
+      tags: [me]
+      summary: Get one of the caller's bookings
+      parameters:
+        - $ref: "#/components/parameters/BookingId"
+      responses:
+        "200":
+          description: The booking.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Booking" }
+        "404":
+          description: |
+            `NOT_FOUND`. Someone else's booking is reported as missing rather
+            than forbidden, because confirming it exists is itself a leak.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/me/bookings/{bookingId}/cancel:
+    post:
+      tags: [me]
+      summary: Cancel the caller's booking
+      parameters:
+        - $ref: "#/components/parameters/BookingId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses:
+        "200":
+          description: Cancelled; the slot is free again.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Booking" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "`INVALID_TRANSITION` — the booking is already finished."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/me/devices:
+    post:
+      tags: [me]
+      summary: Register an FCM token for push
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fcmToken]
+              properties:
+                fcmToken: { type: string }
+      responses:
+        "204": { description: Stored. }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/v1/me/providers:
+    post:
+      tags: [me]
+      summary: Register a business
+      description: |
+        Creates a `pending` provider and makes the caller its owner. A platform
+        admin decides whether it goes live.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateProviderRequest" }
+      responses:
+        "201":
+          description: Registered, awaiting approval.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+        "409":
+          description: "`CONFLICT` — that slug is taken."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/v1/me/invitations/accept:
+    post:
+      tags: [me]
+      summary: Accept a staff invitation
+      description: |
+        The invitation's email must match the accepting account, so a leaked
+        token cannot be redeemed by whoever finds it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+      responses:
+        "200":
+          description: The caller is now a member.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Member" }
+        "401":
+          description: "`INVALID_TOKEN` or `TOKEN_EXPIRED`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: "`FORBIDDEN` — issued to a different address."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: "`CONFLICT` — already accepted."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------- org
+  /api/v1/org/profile:
+    get:
+      tags: [org]
+      summary: Get the organization's profile
+      parameters: [{ $ref: "#/components/parameters/OrganizationId" }]
+      responses:
+        "200":
+          description: The provider, plus the caller's role in it.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  provider: { $ref: "#/components/schemas/Provider" }
+                  role: { $ref: "#/components/schemas/MemberRole" }
+        "400": { $ref: "#/components/responses/OrgRequired" }
+        "403": { $ref: "#/components/responses/NotAMember" }
+    patch:
+      tags: [org]
+      summary: Update the organization's profile
+      description: Requires the `admin` or `owner` role.
+      parameters: [{ $ref: "#/components/parameters/OrganizationId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateProviderRequest" }
+      responses:
+        "200":
+          description: The updated provider.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/v1/org/services:
+    get:
+      tags: [org]
+      summary: List services, including inactive ones
+      parameters: [{ $ref: "#/components/parameters/OrganizationId" }]
+      responses:
+        "200":
+          description: Every service the organization offers.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  services:
+                    type: array
+                    items: { $ref: "#/components/schemas/Service" }
+    post:
+      tags: [org]
+      summary: Create a service
+      description: |
+        `attributes` is validated against the chosen category's `service`-scoped
+        definitions; unknown keys and out-of-enum values are rejected.
+      parameters: [{ $ref: "#/components/parameters/OrganizationId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateServiceRequest" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Service" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/v1/org/services/{serviceId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ServiceId"
+    get:
+      tags: [org]
+      summary: Get a service with its option groups
+      responses:
+        "200":
+          description: The service.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Service" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [org]
+      summary: Update a service
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateServiceRequest" }
+      responses:
+        "200":
+          description: The updated service.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Service" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    delete:
+      tags: [org]
+      summary: Delete a service
+      description: |
+        Existing bookings keep their own snapshot of what was sold, so history
+        survives the deletion.
+      responses:
+        "204": { description: Deleted. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/org/services/{serviceId}/option-groups:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ServiceId"
+    get:
+      tags: [org]
+      summary: List a service's option groups
+      responses:
+        "200":
+          description: The option tree.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  optionGroups:
+                    type: array
+                    items: { $ref: "#/components/schemas/OptionGroup" }
+    post:
+      tags: [org]
+      summary: Create an option group
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateOptionGroupRequest" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OptionGroup" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/v1/org/services/{serviceId}/option-groups/{groupId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ServiceId"
+      - $ref: "#/components/parameters/GroupId"
+    patch:
+      tags: [org]
+      summary: Update an option group
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateOptionGroupRequest" }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OptionGroup" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [org]
+      summary: Delete an option group and its options
+      responses:
+        "204": { description: Deleted. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/org/services/{serviceId}/option-groups/{groupId}/options:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ServiceId"
+      - $ref: "#/components/parameters/GroupId"
+    post:
+      tags: [org]
+      summary: Add an option to a group
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateOptionRequest" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Option" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/v1/org/services/{serviceId}/option-groups/{groupId}/options/{optionId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ServiceId"
+      - $ref: "#/components/parameters/GroupId"
+      - name: optionId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [org]
+      summary: Update an option
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateOptionRequest" }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Option" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [org]
+      summary: Delete an option
+      responses:
+        "204": { description: Deleted. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/org/resources:
+    parameters: [{ $ref: "#/components/parameters/OrganizationId" }]
+    get:
+      tags: [org]
+      summary: List resources
+      responses:
+        "200":
+          description: Bays, chairs or staff — whatever a booking occupies.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  resources:
+                    type: array
+                    items: { $ref: "#/components/schemas/Resource" }
+    post:
+      tags: [org]
+      summary: Create a resource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateResourceRequest" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Resource" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/v1/org/resources/{resourceId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ResourceId"
+    patch:
+      tags: [org]
+      summary: Update a resource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                userId: { type: string, format: uuid, nullable: true }
+                isActive: { type: boolean }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Resource" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [org]
+      summary: Delete a resource
+      description: A resource with bookings cannot be deleted; deactivate it.
+      responses:
+        "204": { description: Deleted. }
+        "409":
+          description: "`CONFLICT` — it has bookings."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/org/resources/{resourceId}/services/{serviceId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ResourceId"
+      - $ref: "#/components/parameters/ServiceId"
+    put:
+      tags: [org]
+      summary: Let a resource perform a service
+      responses:
+        "204": { description: Attached. }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [org]
+      summary: Stop a resource performing a service
+      responses:
+        "204": { description: Detached. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/org/business-hours:
+    parameters: [{ $ref: "#/components/parameters/OrganizationId" }]
+    get:
+      tags: [org]
+      summary: List the weekly opening pattern
+      responses:
+        "200":
+          description: Weekly hours.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  businessHours:
+                    type: array
+                    items: { $ref: "#/components/schemas/BusinessHours" }
+    post:
+      tags: [org]
+      summary: Add a weekly opening span
+      description: |
+        A null `resourceId` is the provider-wide default that resources without
+        their own hours inherit.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateBusinessHoursRequest" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BusinessHours" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/v1/org/business-hours/{hoursId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - name: hoursId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [org]
+      summary: Update a weekly opening span
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                weekday: { type: integer, minimum: 0, maximum: 6 }
+                opensAt: { $ref: "#/components/schemas/TimeOfDay" }
+                closesAt: { $ref: "#/components/schemas/TimeOfDay" }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BusinessHours" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [org]
+      summary: Delete a weekly opening span
+      responses:
+        "204": { description: Deleted. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/org/schedule-exceptions:
+    parameters: [{ $ref: "#/components/parameters/OrganizationId" }]
+    get:
+      tags: [org]
+      summary: List one-date overrides
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: Overrides in the range.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scheduleExceptions:
+                    type: array
+                    items: { $ref: "#/components/schemas/ScheduleException" }
+    post:
+      tags: [org]
+      summary: Close a date, or open it differently
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateScheduleExceptionRequest" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScheduleException" }
+        "409":
+          description: "`CONFLICT` — that date and scope already has one."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/v1/org/schedule-exceptions/{exceptionId}:
+    delete:
+      tags: [org]
+      summary: Delete a one-date override
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: exceptionId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "204": { description: Deleted. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/org/bookings:
+    parameters: [{ $ref: "#/components/parameters/OrganizationId" }]
+    get:
+      tags: [org]
+      summary: The bookings inbox
+      parameters:
+        - name: date
+          in: query
+          description: One local day in the provider's timezone.
+          schema: { type: string, format: date }
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/BookingStatus" }
+        - name: resourceId
+          in: query
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Bookings in chronological order.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Page"
+                  - type: object
+                    properties:
+                      bookings:
+                        type: array
+                        items: { $ref: "#/components/schemas/Booking" }
+    post:
+      tags: [org]
+      summary: Enter a walk-in
+      description: |
+        A booking taken at the counter. It has no customer account behind it,
+        so `customerName` and `customerPhone` carry the contact details instead.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/CreateBookingRequest"
+                - type: object
+                  properties:
+                    resourceId:
+                      type: string
+                      format: uuid
+                      description: Pin the booking to one resource.
+                    customerName: { type: string }
+                    customerPhone: { type: string }
+      responses:
+        "201":
+          description: Reserved.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Booking" }
+        "409":
+          description: "`SLOT_TAKEN`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/v1/org/bookings/{bookingId}:
+    get:
+      tags: [org]
+      summary: Get one of the organization's bookings
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/BookingId"
+      responses:
+        "200":
+          description: The booking.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Booking" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/org/bookings/{bookingId}/confirm:
+    post:
+      tags: [org]
+      summary: Confirm a pending booking
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/BookingId"
+      responses:
+        "200": { $ref: "#/components/responses/BookingTransitioned" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /api/v1/org/bookings/{bookingId}/start:
+    post:
+      tags: [org]
+      summary: Mark a confirmed booking as under way
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/BookingId"
+      responses:
+        "200": { $ref: "#/components/responses/BookingTransitioned" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /api/v1/org/bookings/{bookingId}/complete:
+    post:
+      tags: [org]
+      summary: Complete a booking in progress
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/BookingId"
+      responses:
+        "200": { $ref: "#/components/responses/BookingTransitioned" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /api/v1/org/bookings/{bookingId}/no-show:
+    post:
+      tags: [org]
+      summary: Record that the customer did not turn up
+      description: Only a confirmed booking can become a no-show.
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/BookingId"
+      responses:
+        "200": { $ref: "#/components/responses/BookingTransitioned" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /api/v1/org/bookings/{bookingId}/cancel:
+    post:
+      tags: [org]
+      summary: Cancel a booking as the provider
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/BookingId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/BookingTransitioned" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /api/v1/org/stats/summary:
+    get:
+      tags: [org]
+      summary: Booking counts and completed revenue
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          description: Inclusive.
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: The summary.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Stats" }
+
+  /api/v1/org/members:
+    get:
+      tags: [org]
+      summary: List staff
+      parameters: [{ $ref: "#/components/parameters/OrganizationId" }]
+      responses:
+        "200":
+          description: Members, most privileged first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  members:
+                    type: array
+                    items: { $ref: "#/components/schemas/Member" }
+
+  /api/v1/org/members/{userId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - name: userId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [org]
+      summary: Change a member's role
+      description: Owner only. A provider must keep at least one owner.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: { $ref: "#/components/schemas/MemberRole" }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Member" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: "`CONFLICT` — that would remove the last owner."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [org]
+      summary: Remove a member
+      description: Owner only. A provider must keep at least one owner.
+      responses:
+        "204": { description: Removed. }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: "`CONFLICT` — that would remove the last owner."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/org/invitations:
+    parameters: [{ $ref: "#/components/parameters/OrganizationId" }]
+    get:
+      tags: [org]
+      summary: List invitations
+      responses:
+        "200":
+          description: Invitations, newest first. Tokens are never included.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invitations:
+                    type: array
+                    items: { $ref: "#/components/schemas/Invitation" }
+    post:
+      tags: [org]
+      summary: Invite someone to join the organization
+      description: |
+        The response carries the plaintext `token` exactly once — only its hash
+        is stored, so it cannot be retrieved again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, role]
+              properties:
+                email: { type: string, format: email }
+                role: { $ref: "#/components/schemas/MemberRole" }
+      responses:
+        "201":
+          description: Invited.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Invitation" }
+        "409":
+          description: "`CONFLICT` — one is already pending for that address."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/org/invitations/{invitationId}:
+    delete:
+      tags: [org]
+      summary: Revoke a pending invitation
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: invitationId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "204": { description: Revoked. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ---------------------------------------------------------------- admin
+  /api/v1/admin/categories:
+    get:
+      tags: [admin]
+      summary: List every category, active or not
+      responses:
+        "200":
+          description: All categories.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  categories:
+                    type: array
+                    items: { $ref: "#/components/schemas/Category" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [admin]
+      summary: Create a category
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                slug: { type: string, description: Derived from the name if omitted. }
+                icon: { type: string }
+                parentId: { type: string, format: uuid, nullable: true }
+                sortOrder: { type: integer }
+                isActive: { type: boolean, default: true }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Category" }
+        "409":
+          description: "`CONFLICT` — that slug is taken."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/admin/categories/{categoryId}:
+    parameters: [{ $ref: "#/components/parameters/CategoryId" }]
+    get:
+      tags: [admin]
+      summary: Get a category
+      responses:
+        "200":
+          description: The category.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Category" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [admin]
+      summary: Update a category
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                slug: { type: string }
+                icon: { type: string }
+                sortOrder: { type: integer }
+                isActive: { type: boolean }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Category" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [admin]
+      summary: Delete a category
+      description: |
+        Fails while services still reference it — deactivate it instead, so a
+        vertical is never pulled out from under a live tenant.
+      responses:
+        "204": { description: Deleted. }
+        "409":
+          description: "`CONFLICT` — services still use it."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/admin/categories/{categoryId}/attributes:
+    parameters: [{ $ref: "#/components/parameters/CategoryId" }]
+    get:
+      tags: [admin]
+      summary: List a category's attribute definitions
+      responses:
+        "200":
+          description: The definitions.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  attributes:
+                    type: array
+                    items: { $ref: "#/components/schemas/Attribute" }
+    post:
+      tags: [admin]
+      summary: Define an attribute
+      description: |
+        This is how a new vertical gets its own fields. Both clients pick the
+        definition up from `/public/categories/{id}/attributes` immediately.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateAttributeRequest" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Attribute" }
+        "409":
+          description: "`CONFLICT` — that key already exists for this scope."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/v1/admin/categories/{categoryId}/attributes/{attributeId}:
+    parameters:
+      - $ref: "#/components/parameters/CategoryId"
+      - name: attributeId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [admin]
+      summary: Update an attribute definition
+      description: |
+        `key` and `appliesTo` cannot change: either would orphan every value
+        already stored under the old identity.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label: { type: string }
+                dataType: { $ref: "#/components/schemas/AttributeDataType" }
+                options:
+                  type: array
+                  items: { type: string }
+                required: { type: boolean }
+                filterable: { type: boolean }
+                sortOrder: { type: integer }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Attribute" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [admin]
+      summary: Delete an attribute definition
+      responses:
+        "204": { description: Deleted. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/admin/providers:
+    get:
+      tags: [admin]
+      summary: List providers across all tenants
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/ProviderStatus" }
+        - name: search
+          in: query
+          schema: { type: string }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Providers, newest first.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Page"
+                  - type: object
+                    properties:
+                      providers:
+                        type: array
+                        items: { $ref: "#/components/schemas/Provider" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [admin]
+      summary: Onboard a provider directly
+      description: For businesses signed up offline; it has no owner until invited.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateProviderRequest" }
+      responses:
+        "201":
+          description: Created, pending approval.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+
+  /api/v1/admin/providers/{providerId}:
+    get:
+      tags: [admin]
+      summary: Get a provider and its members
+      parameters: [{ $ref: "#/components/parameters/ProviderId" }]
+      responses:
+        "200":
+          description: The provider and its staff.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  provider: { $ref: "#/components/schemas/Provider" }
+                  members:
+                    type: array
+                    items: { $ref: "#/components/schemas/Member" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/admin/providers/{providerId}/approve:
+    post:
+      tags: [admin]
+      summary: Make a provider live
+      parameters: [{ $ref: "#/components/parameters/ProviderId" }]
+      responses:
+        "200":
+          description: Now `active` and visible on the public surface.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/admin/providers/{providerId}/suspend:
+    post:
+      tags: [admin]
+      summary: Suspend a provider
+      parameters: [{ $ref: "#/components/parameters/ProviderId" }]
+      responses:
+        "200":
+          description: Now `suspended` and hidden from the public surface.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/admin/bookings:
+    get:
+      tags: [admin]
+      summary: List bookings across all tenants
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/BookingStatus" }
+        - name: providerId
+          in: query
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: A flat triage view, newest first.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Page"
+                  - type: object
+                    properties:
+                      bookings:
+                        type: array
+                        items: { $ref: "#/components/schemas/AdminBooking" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/admin/users:
+    get:
+      tags: [admin]
+      summary: List platform users
+      parameters:
+        - name: search
+          in: query
+          description: Matches name or email.
+          schema: { type: string }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Users, newest first.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Page"
+                  - type: object
+                    properties:
+                      users:
+                        type: array
+                        items: { $ref: "#/components/schemas/User" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        A 15-minute access token, verified locally on every request. Refresh it
+        with `POST /api/v1/auth/refresh`.
+
+  parameters:
+    OrganizationId:
+      name: x-organization-id
+      in: header
+      required: true
+      description: |
+        The organization to act within. Client-supplied and never trusted: every
+        `/org/*` request re-reads the caller's membership from the database
+        before any org-scoped data is touched.
+      schema: { type: string, format: uuid }
+    CategoryId:
+      name: categoryId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ProviderId:
+      name: providerId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ServiceId:
+      name: serviceId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    GroupId:
+      name: groupId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ResourceId:
+      name: resourceId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    BookingId:
+      name: bookingId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+
+  responses:
+    Error:
+      description: An error, in the standard envelope.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthenticated:
+      description: "`UNAUTHENTICATED`, `INVALID_TOKEN` or `TOKEN_EXPIRED`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: "`FORBIDDEN` — authenticated, but not allowed to do this."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotAMember:
+      description: "`NOT_A_MEMBER` — not a member of that organization."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    OrgRequired:
+      description: "`ORG_REQUIRED` — the `x-organization-id` header is missing."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: "`NOT_FOUND`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationError:
+      description: "`VALIDATION_ERROR`, with per-field detail where applicable."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InvalidTransition:
+      description: "`INVALID_TRANSITION` — the booking is not in a state that allows it."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    BookingTransitioned:
+      description: The updated booking.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Booking" }
+
+  schemas:
+    Error:
+      type: object
+      required: [message, code]
+      properties:
+        message:
+          type: string
+          description: Human-readable and safe to show a user.
+          example: That slot was just taken
+        code:
+          type: string
+          description: |
+            Stable machine-readable code. Clients switch on this, so it is part
+            of the contract and additive-only.
+          enum:
+            - INVALID_CREDENTIALS
+            - EMAIL_TAKEN
+            - UNAUTHENTICATED
+            - FORBIDDEN
+            - NOT_A_MEMBER
+            - TOKEN_EXPIRED
+            - INVALID_TOKEN
+            - VALIDATION_ERROR
+            - ORG_REQUIRED
+            - NOT_FOUND
+            - SLOT_TAKEN
+            - OUTSIDE_HOURS
+            - INVALID_TRANSITION
+            - SERVICE_INACTIVE
+            - PROVIDER_INACTIVE
+            - CONFLICT
+            - INTERNAL_ERROR
+          example: SLOT_TAKEN
+        details:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            Per-field problems, keyed by attribute. Present on validation
+            failures only; a client that reads just `message` and `code` is
+            unaffected by it.
+
+    TimeOfDay:
+      type: string
+      pattern: '^([01][0-9]|2[0-4]):[0-5][0-9]$'
+      description: A wall-clock time in the provider's timezone.
+      example: "09:30"
+
+    Page:
+      type: object
+      properties:
+        total: { type: integer, format: int64 }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    User:
+      type: object
+      required: [id, name, email, platformRole, emailVerified, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string, nullable: true }
+        platformRole:
+          type: string
+          enum: [user, admin]
+        emailVerified: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    MemberRole:
+      type: string
+      enum: [owner, admin, staff]
+
+    Membership:
+      type: object
+      required: [providerId, role]
+      properties:
+        providerId: { type: string, format: uuid }
+        role: { $ref: "#/components/schemas/MemberRole" }
+
+    Member:
+      type: object
+      properties:
+        providerId: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        role: { $ref: "#/components/schemas/MemberRole" }
+        name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    Invitation:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        providerId: { type: string, format: uuid }
+        email: { type: string, format: email }
+        role: { $ref: "#/components/schemas/MemberRole" }
+        expiresAt: { type: string, format: date-time }
+        acceptedAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+        token:
+          type: string
+          description: |
+            Returned only in the response to creating the invitation. Only its
+            hash is stored, so it is never readable again.
+
+    Tokens:
+      type: object
+      required: [accessToken, refreshToken, expiresAt, tokenType]
+      properties:
+        accessToken:
+          type: string
+          description: A 15-minute JWT.
+        refreshToken:
+          type: string
+          description: |
+            Opaque and single-use. 30 days for `web`, 90 for `mobile`. Store it
+            in `expo-secure-store` on mobile, never `AsyncStorage`.
+        expiresAt: { type: string, format: date-time }
+        tokenType: { type: string, enum: [Bearer] }
+
+    Session:
+      type: object
+      required: [user, memberships, tokens]
+      properties:
+        user: { $ref: "#/components/schemas/User" }
+        memberships:
+          type: array
+          description: Empty for a customer. That is the whole difference.
+          items: { $ref: "#/components/schemas/Membership" }
+        tokens: { $ref: "#/components/schemas/Tokens" }
+
+    SignUpRequest:
+      type: object
+      required: [name, email, password]
+      properties:
+        name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string }
+        password: { type: string, minLength: 8, format: password }
+        clientType:
+          type: string
+          enum: [web, mobile]
+          default: web
+          description: Decides the refresh-token lifetime.
+
+    SignInRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password }
+        clientType: { type: string, enum: [web, mobile], default: web }
+
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken: { type: string }
+
+    Location:
+      type: object
+      required: [lat, lng]
+      properties:
+        lat: { type: number, format: double, minimum: -90, maximum: 90 }
+        lng: { type: number, format: double, minimum: -180, maximum: 180 }
+
+    ProviderStatus:
+      type: string
+      enum: [pending, active, suspended]
+
+    BookingMode:
+      type: string
+      enum: [request, instant]
+      description: |
+        `instant` skips `pending` and confirms at creation; `request` waits for
+        the provider to approve.
+
+    Provider:
+      type: object
+      required: [id, slug, name, status, timezone, bookingMode]
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string }
+        name: { type: string }
+        phone: { type: string, nullable: true }
+        email: { type: string, nullable: true }
+        description: { type: string, nullable: true }
+        city: { type: string, nullable: true }
+        address: { type: string, nullable: true }
+        location: { $ref: "#/components/schemas/Location" }
+        timezone:
+          type: string
+          description: IANA zone; all slot maths happens here.
+          example: Africa/Addis_Ababa
+        logoUrl: { type: string, nullable: true }
+        licenseNumber: { type: string, nullable: true }
+        status: { $ref: "#/components/schemas/ProviderStatus" }
+        ratingAvg: { type: number, format: double }
+        ratingCount: { type: integer }
+        bookingMode: { $ref: "#/components/schemas/BookingMode" }
+        minLeadMinutes:
+          type: integer
+          description: Slots sooner than this from now are not offered.
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    CreateProviderRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        slug: { type: string, description: Derived from the name if omitted. }
+        phone: { type: string }
+        email: { type: string, format: email }
+        description: { type: string }
+        city: { type: string }
+        address: { type: string }
+        location: { $ref: "#/components/schemas/Location" }
+        timezone: { type: string, default: Africa/Addis_Ababa }
+        licenseNumber: { type: string }
+        bookingMode: { $ref: "#/components/schemas/BookingMode" }
+        minLeadMinutes: { type: integer, minimum: 0 }
+        categoryIds:
+          type: array
+          items: { type: string, format: uuid }
+
+    UpdateProviderRequest:
+      type: object
+      description: Omitted fields are left unchanged.
+      properties:
+        name: { type: string }
+        phone: { type: string }
+        email: { type: string, format: email }
+        description: { type: string }
+        city: { type: string }
+        address: { type: string }
+        location: { $ref: "#/components/schemas/Location" }
+        timezone: { type: string }
+        licenseNumber: { type: string }
+        bookingMode: { $ref: "#/components/schemas/BookingMode" }
+        minLeadMinutes: { type: integer, minimum: 0 }
+
+    Category:
+      type: object
+      required: [id, slug, name, isActive]
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string }
+        name: { type: string }
+        icon: { type: string, nullable: true }
+        parentId: { type: string, format: uuid, nullable: true }
+        sortOrder: { type: integer }
+        isActive: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    AttributeDataType:
+      type: string
+      enum: [enum, multi_enum, text, number, bool]
+
+    AttributeScope:
+      type: string
+      enum: [service, booking, provider]
+      description: |
+        What the field describes. `service` fields are set by the provider on a
+        service; `booking` fields are asked of the customer at reservation time.
+
+    Attribute:
+      type: object
+      required: [id, categoryId, key, label, dataType, required, appliesTo]
+      properties:
+        id: { type: string, format: uuid }
+        categoryId: { type: string, format: uuid }
+        key:
+          type: string
+          description: Stable machine name, e.g. `vehicle_size`.
+        label: { type: string }
+        dataType: { $ref: "#/components/schemas/AttributeDataType" }
+        options:
+          type: array
+          description: Allowed values for `enum` and `multi_enum`.
+          items: { type: string }
+        required: { type: boolean }
+        appliesTo: { $ref: "#/components/schemas/AttributeScope" }
+        filterable:
+          type: boolean
+          description: Whether discovery may build a filter from it.
+        sortOrder: { type: integer }
+
+    CreateAttributeRequest:
+      type: object
+      required: [key, label, dataType, appliesTo]
+      properties:
+        key: { type: string }
+        label: { type: string }
+        dataType: { $ref: "#/components/schemas/AttributeDataType" }
+        options:
+          type: array
+          description: Required and non-empty for `enum` and `multi_enum`.
+          items: { type: string }
+        required: { type: boolean, default: false }
+        appliesTo: { $ref: "#/components/schemas/AttributeScope" }
+        filterable: { type: boolean, default: false }
+        sortOrder: { type: integer, default: 0 }
+
+    Service:
+      type: object
+      required: [id, providerId, categoryId, name, priceCents, currency, durationMinutes, isActive]
+      properties:
+        id: { type: string, format: uuid }
+        providerId: { type: string, format: uuid }
+        categoryId: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        priceCents:
+          type: integer
+          description: Minor units. 24500 = 245.00 ETB.
+        currency: { type: string, default: ETB }
+        durationMinutes:
+          type: integer
+          description: The scheduling engine's only real input.
+        bufferMinutes:
+          type: integer
+          description: Added after the service; occupies the resource but is not priced.
+        attributes:
+          type: object
+          additionalProperties: true
+          description: Validated against the category's `service` definitions.
+        imageUrl: { type: string, nullable: true }
+        isActive: { type: boolean }
+        optionGroups:
+          type: array
+          description: Present on the detail endpoints only.
+          items: { $ref: "#/components/schemas/OptionGroup" }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    CreateServiceRequest:
+      type: object
+      required: [categoryId, name, priceCents, durationMinutes]
+      properties:
+        categoryId: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string }
+        priceCents: { type: integer, minimum: 0 }
+        currency: { type: string, default: ETB }
+        durationMinutes: { type: integer, minimum: 1 }
+        bufferMinutes: { type: integer, minimum: 0, default: 0 }
+        attributes:
+          type: object
+          additionalProperties: true
+        isActive: { type: boolean, default: true }
+
+    UpdateServiceRequest:
+      type: object
+      description: Omitted fields are left unchanged.
+      properties:
+        categoryId: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string }
+        priceCents: { type: integer, minimum: 0 }
+        currency: { type: string }
+        durationMinutes: { type: integer, minimum: 1 }
+        bufferMinutes: { type: integer, minimum: 0 }
+        attributes:
+          type: object
+          additionalProperties: true
+        isActive: { type: boolean }
+
+    OptionGroup:
+      type: object
+      required: [id, serviceId, name, selectionType, isRequired]
+      properties:
+        id: { type: string, format: uuid }
+        serviceId: { type: string, format: uuid }
+        name: { type: string, example: Vehicle size }
+        selectionType:
+          type: string
+          enum: [single, multi]
+          description: Radio versus checkbox, with one mechanism.
+        isRequired: { type: boolean }
+        minSelect: { type: integer }
+        maxSelect: { type: integer, nullable: true }
+        sortOrder: { type: integer }
+        options:
+          type: array
+          items: { $ref: "#/components/schemas/Option" }
+
+    CreateOptionGroupRequest:
+      type: object
+      required: [name, selectionType]
+      properties:
+        name: { type: string }
+        selectionType: { type: string, enum: [single, multi] }
+        isRequired: { type: boolean, default: false }
+        minSelect: { type: integer, minimum: 0, default: 0 }
+        maxSelect: { type: integer, minimum: 1, nullable: true }
+        sortOrder: { type: integer, default: 0 }
+
+    Option:
+      type: object
+      required: [id, groupId, name, priceDeltaCents, durationDeltaMinutes, isActive]
+      properties:
+        id: { type: string, format: uuid }
+        groupId: { type: string, format: uuid }
+        name: { type: string, example: SUV }
+        priceDeltaCents:
+          type: integer
+          description: Added to the service's price when chosen.
+        durationDeltaMinutes:
+          type: integer
+          description: Added to the service's duration when chosen.
+        isActive: { type: boolean }
+        sortOrder: { type: integer }
+
+    CreateOptionRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        priceDeltaCents: { type: integer, default: 0 }
+        durationDeltaMinutes: { type: integer, default: 0 }
+        isActive: { type: boolean, default: true }
+        sortOrder: { type: integer, default: 0 }
+
+    Resource:
+      type: object
+      required: [id, providerId, name, isActive]
+      properties:
+        id: { type: string, format: uuid }
+        providerId: { type: string, format: uuid }
+        name: { type: string, example: Bay 1 }
+        userId:
+          type: string
+          format: uuid
+          nullable: true
+          description: The staff account this resource belongs to, if any.
+        isActive: { type: boolean }
+        serviceIds:
+          type: array
+          items: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    CreateResourceRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        userId: { type: string, format: uuid, nullable: true }
+        isActive: { type: boolean, default: true }
+        serviceIds:
+          type: array
+          items: { type: string, format: uuid }
+
+    BusinessHours:
+      type: object
+      required: [id, providerId, weekday, opensAt, closesAt]
+      properties:
+        id: { type: string, format: uuid }
+        providerId: { type: string, format: uuid }
+        resourceId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Null is the provider-wide default.
+        weekday:
+          type: integer
+          minimum: 0
+          maximum: 6
+          description: 0 = Sunday.
+        opensAt: { $ref: "#/components/schemas/TimeOfDay" }
+        closesAt: { $ref: "#/components/schemas/TimeOfDay" }
+
+    CreateBusinessHoursRequest:
+      type: object
+      required: [weekday, opensAt, closesAt]
+      properties:
+        resourceId: { type: string, format: uuid, nullable: true }
+        weekday: { type: integer, minimum: 0, maximum: 6 }
+        opensAt: { $ref: "#/components/schemas/TimeOfDay" }
+        closesAt: { $ref: "#/components/schemas/TimeOfDay" }
+
+    ScheduleException:
+      type: object
+      required: [id, providerId, date, isClosed]
+      properties:
+        id: { type: string, format: uuid }
+        providerId: { type: string, format: uuid }
+        resourceId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Null applies to the whole provider.
+        date: { type: string, format: date }
+        isClosed: { type: boolean }
+        opensAt: { $ref: "#/components/schemas/TimeOfDay" }
+        closesAt: { $ref: "#/components/schemas/TimeOfDay" }
+        reason: { type: string, nullable: true }
+
+    CreateScheduleExceptionRequest:
+      type: object
+      required: [date]
+      properties:
+        resourceId: { type: string, format: uuid, nullable: true }
+        date: { type: string, format: date }
+        isClosed: { type: boolean, default: true }
+        opensAt:
+          allOf: [{ $ref: "#/components/schemas/TimeOfDay" }]
+          description: Required when `isClosed` is false, forbidden otherwise.
+        closesAt:
+          allOf: [{ $ref: "#/components/schemas/TimeOfDay" }]
+          description: Required when `isClosed` is false, forbidden otherwise.
+        reason: { type: string }
+
+    Slot:
+      type: object
+      required: [startsAt, resourceIds]
+      properties:
+        startsAt: { type: string, format: date-time }
+        resourceIds:
+          type: array
+          description: The resources that could take this start.
+          items: { type: string, format: uuid }
+
+    BookingStatus:
+      type: string
+      enum:
+        - pending
+        - confirmed
+        - in_progress
+        - completed
+        - cancelled_by_customer
+        - cancelled_by_provider
+        - no_show
+
+    BookedOption:
+      type: object
+      description: A snapshot of the add-on as it was when reserved.
+      properties:
+        optionId: { type: string, format: uuid, nullable: true }
+        name: { type: string }
+        priceDeltaCents: { type: integer }
+        durationDeltaMinutes: { type: integer }
+
+    ProviderSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string }
+        name: { type: string }
+        logoUrl: { type: string, nullable: true }
+        city: { type: string, nullable: true }
+        timezone: { type: string }
+
+    Booking:
+      type: object
+      required: [id, code, providerId, resourceId, startsAt, endsAt, status, serviceName, priceCents, currency, durationMinutes]
+      properties:
+        id: { type: string, format: uuid }
+        code:
+          type: string
+          description: Short human reference.
+          example: BK-7QK2
+        providerId: { type: string, format: uuid }
+        serviceId: { type: string, format: uuid, nullable: true }
+        resourceId: { type: string, format: uuid }
+        customerId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Null for a walk-in entered by staff.
+        startsAt: { type: string, format: date-time }
+        endsAt:
+          type: string
+          format: date-time
+          description: Includes the service's buffer.
+        status: { $ref: "#/components/schemas/BookingStatus" }
+        serviceName:
+          type: string
+          description: |
+            Snapshotted at reservation time, like every field below it. A price
+            change or a rename must never rewrite what somebody already booked.
+        priceCents: { type: integer }
+        currency: { type: string }
+        durationMinutes: { type: integer }
+        attributes:
+          type: object
+          additionalProperties: true
+        customerNote: { type: string, nullable: true }
+        customerName: { type: string, nullable: true }
+        customerPhone: { type: string, nullable: true }
+        cancelledBy:
+          type: string
+          nullable: true
+          enum: [customer, provider]
+        cancelReason: { type: string, nullable: true }
+        options:
+          type: array
+          items: { $ref: "#/components/schemas/BookedOption" }
+        provider: { $ref: "#/components/schemas/ProviderSummary" }
+        resourceName: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    CreateBookingRequest:
+      type: object
+      required: [serviceId, startsAt]
+      description: |
+        Carries no price, duration or end time. The server derives all three
+        from the catalog, so a client cannot assert its own totals.
+      properties:
+        serviceId: { type: string, format: uuid }
+        startsAt:
+          type: string
+          format: date-time
+          description: Must be one of the starts availability offered.
+        optionIds:
+          type: array
+          description: Chosen add-ons. Required groups must be satisfied.
+          items: { type: string, format: uuid }
+        attributes:
+          type: object
+          additionalProperties: true
+          description: Validated against the category's `booking` definitions.
+        note: { type: string }
+
+    AdminBooking:
+      type: object
+      description: The flat cross-tenant triage view.
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        status: { $ref: "#/components/schemas/BookingStatus" }
+        providerId: { type: string, format: uuid }
+        providerSlug: { type: string }
+        providerName: { type: string }
+        serviceName: { type: string }
+        priceCents: { type: integer }
+        currency: { type: string }
+        durationMinutes: { type: integer }
+        startsAt: { type: string, format: date-time }
+        endsAt: { type: string, format: date-time }
+        customerName: { type: string, nullable: true }
+        customerEmail: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    Stats:
+      type: object
+      properties:
+        pending: { type: integer, format: int64 }
+        confirmed: { type: integer, format: int64 }
+        inProgress: { type: integer, format: int64 }
+        completed: { type: integer, format: int64 }
+        cancelled: { type: integer, format: int64 }
+        noShow: { type: integer, format: int64 }
+        completedRevenueCents: { type: integer, format: int64 }

@@ -1,0 +1,30 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - misspell
+    - revive
+    - unconvert
+    - whitespace
+
+  exclusions:
+    generated: lax
+    rules:
+      # sqlc and oapi-codegen output is not ours to style.
+      - path: internal/db/
+        linters: [revive, staticcheck, unused]
+      - path: internal/apitypes/
+        linters: [revive, staticcheck, unused]
+      # Table-driven tests repeat themselves by design.
+      - path: _test\.go
+        linters: [errcheck, dupl]
+
+formatters:
+  enable:
+    - gofmt
