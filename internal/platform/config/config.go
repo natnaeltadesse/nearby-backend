@@ -50,7 +50,12 @@ type Config struct {
 	MinLeadMinutes       int           `envconfig:"MIN_LEAD_MINUTES" default:"30"`
 	AvailabilityCacheTTL time.Duration `envconfig:"AVAILABILITY_CACHE_TTL" default:"60s"`
 
-	// ---- media (milestone 9)
+	// ---- media
+	// Where uploads are kept when no hosted provider is configured. Ephemeral
+	// in a container and not shared between replicas — development only.
+	MediaLocalDir string `envconfig:"MEDIA_LOCAL_DIR" default:"./uploads"`
+	// Setting all three Cloudinary values switches storage over; leaving any
+	// of them blank keeps uploads on local disk.
 	CloudinaryCloudName    string `envconfig:"CLOUDINARY_CLOUD_NAME"`
 	CloudinaryAPIKey       string `envconfig:"CLOUDINARY_API_KEY"`
 	CloudinaryAPISecret    string `envconfig:"CLOUDINARY_API_SECRET"`

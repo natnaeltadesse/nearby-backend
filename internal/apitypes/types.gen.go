@@ -336,6 +336,84 @@ func (e UserPlatformRole) Valid() bool {
 	}
 }
 
+// Defines values for PostApiV1OrgMembersJSONBodyRole.
+const (
+	PostApiV1OrgMembersJSONBodyRoleAdmin PostApiV1OrgMembersJSONBodyRole = "admin"
+	PostApiV1OrgMembersJSONBodyRoleStaff PostApiV1OrgMembersJSONBodyRole = "staff"
+)
+
+// Valid indicates whether the value is a known member of the PostApiV1OrgMembersJSONBodyRole enum.
+func (e PostApiV1OrgMembersJSONBodyRole) Valid() bool {
+	switch e {
+	case PostApiV1OrgMembersJSONBodyRoleAdmin:
+		return true
+	case PostApiV1OrgMembersJSONBodyRoleStaff:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for GetApiV1OrgServicesParamsIsActive.
+const (
+	False GetApiV1OrgServicesParamsIsActive = "false"
+	True  GetApiV1OrgServicesParamsIsActive = "true"
+)
+
+// Valid indicates whether the value is a known member of the GetApiV1OrgServicesParamsIsActive enum.
+func (e GetApiV1OrgServicesParamsIsActive) Valid() bool {
+	switch e {
+	case False:
+		return true
+	case True:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for GetApiV1OrgServicesParamsSort.
+const (
+	GetApiV1OrgServicesParamsSortCategory      GetApiV1OrgServicesParamsSort = "category"
+	GetApiV1OrgServicesParamsSortCreated       GetApiV1OrgServicesParamsSort = "created"
+	GetApiV1OrgServicesParamsSortDuration      GetApiV1OrgServicesParamsSort = "duration"
+	GetApiV1OrgServicesParamsSortMinusCategory GetApiV1OrgServicesParamsSort = "-category"
+	GetApiV1OrgServicesParamsSortMinusCreated  GetApiV1OrgServicesParamsSort = "-created"
+	GetApiV1OrgServicesParamsSortMinusDuration GetApiV1OrgServicesParamsSort = "-duration"
+	GetApiV1OrgServicesParamsSortMinusName     GetApiV1OrgServicesParamsSort = "-name"
+	GetApiV1OrgServicesParamsSortMinusPrice    GetApiV1OrgServicesParamsSort = "-price"
+	GetApiV1OrgServicesParamsSortName          GetApiV1OrgServicesParamsSort = "name"
+	GetApiV1OrgServicesParamsSortPrice         GetApiV1OrgServicesParamsSort = "price"
+)
+
+// Valid indicates whether the value is a known member of the GetApiV1OrgServicesParamsSort enum.
+func (e GetApiV1OrgServicesParamsSort) Valid() bool {
+	switch e {
+	case GetApiV1OrgServicesParamsSortCategory:
+		return true
+	case GetApiV1OrgServicesParamsSortCreated:
+		return true
+	case GetApiV1OrgServicesParamsSortDuration:
+		return true
+	case GetApiV1OrgServicesParamsSortMinusCategory:
+		return true
+	case GetApiV1OrgServicesParamsSortMinusCreated:
+		return true
+	case GetApiV1OrgServicesParamsSortMinusDuration:
+		return true
+	case GetApiV1OrgServicesParamsSortMinusName:
+		return true
+	case GetApiV1OrgServicesParamsSortMinusPrice:
+		return true
+	case GetApiV1OrgServicesParamsSortName:
+		return true
+	case GetApiV1OrgServicesParamsSortPrice:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for GetApiV1PublicCategoriesCategoryIdAttributesParamsAppliesTo.
 const (
 	GetApiV1PublicCategoriesCategoryIdAttributesParamsAppliesToBooking  GetApiV1PublicCategoriesCategoryIdAttributesParamsAppliesTo = "booking"
@@ -681,10 +759,16 @@ type Member struct {
 // MemberRole defines model for MemberRole.
 type MemberRole string
 
-// Membership defines model for Membership.
+// Membership One organization the caller belongs to. `name`, `slug` and `status`
+// are carried here so a client can name the organizations someone owns
+// without a request per membership; the JWT claim keeps the smaller
+// `providerId` + `role` pair.
 type Membership struct {
+	Name       string             `json:"name"`
 	ProviderId openapi_types.UUID `json:"providerId"`
 	Role       MemberRole         `json:"role"`
+	Slug       string             `json:"slug"`
+	Status     ProviderStatus     `json:"status"`
 }
 
 // Option defines model for Option.
@@ -825,9 +909,13 @@ type Service struct {
 	// BufferMinutes Added after the service; occupies the resource but is not priced.
 	BufferMinutes *int               `json:"bufferMinutes,omitempty"`
 	CategoryId    openapi_types.UUID `json:"categoryId"`
-	CreatedAt     *time.Time         `json:"createdAt,omitempty"`
-	Currency      string             `json:"currency"`
-	Description   *string            `json:"description,omitempty"`
+
+	// CategoryName Populated by the list endpoints, which join it anyway in order to
+	// sort by it. Absent elsewhere.
+	CategoryName *string    `json:"categoryName,omitempty"`
+	CreatedAt    *time.Time `json:"createdAt,omitempty"`
+	Currency     string     `json:"currency"`
+	Description  *string    `json:"description,omitempty"`
 
 	// DurationMinutes The scheduling engine's only real input.
 	DurationMinutes int                `json:"durationMinutes"`
@@ -843,6 +931,19 @@ type Service struct {
 	PriceCents int                `json:"priceCents"`
 	ProviderId openapi_types.UUID `json:"providerId"`
 	UpdatedAt  *time.Time         `json:"updatedAt,omitempty"`
+}
+
+// ServiceImage defines model for ServiceImage.
+type ServiceImage struct {
+	Caption   *string            `json:"caption,omitempty"`
+	CreatedAt time.Time          `json:"createdAt"`
+	Id        openapi_types.UUID `json:"id"`
+
+	// ImageUrl Opaque. Relative when uploads are stored locally, absolute when a
+	// hosted provider serves them. Never build one client-side.
+	ImageUrl  string             `json:"imageUrl"`
+	ServiceId openapi_types.UUID `json:"serviceId"`
+	SortOrder int                `json:"sortOrder"`
 }
 
 // Session defines model for Session.
@@ -1066,6 +1167,18 @@ type GetApiV1AdminUsersParams struct {
 	Offset *Offset `form:"offset,omitempty" json:"offset,omitempty"`
 }
 
+// PostApiV1AuthResendVerificationJSONBody defines parameters for PostApiV1AuthResendVerification.
+type PostApiV1AuthResendVerificationJSONBody struct {
+	Email openapi_types.Email `json:"email"`
+}
+
+// PostApiV1AuthVerifyEmailJSONBody defines parameters for PostApiV1AuthVerifyEmail.
+type PostApiV1AuthVerifyEmailJSONBody struct {
+	// Code Example: 418205
+	Code  string              `json:"code"`
+	Email openapi_types.Email `json:"email"`
+}
+
 // GetApiV1MeBookingsParams defines parameters for GetApiV1MeBookings.
 type GetApiV1MeBookingsParams struct {
 	Status *BookingStatus `form:"status,omitempty" json:"status,omitempty"`
@@ -1273,6 +1386,28 @@ type GetApiV1OrgMembersParams struct {
 	XOrganizationId OrganizationId `json:"x-organization-id"`
 }
 
+// PostApiV1OrgMembersJSONBody defines parameters for PostApiV1OrgMembers.
+type PostApiV1OrgMembersJSONBody struct {
+	Email openapi_types.Email `json:"email"`
+	Name  string              `json:"name"`
+
+	// Password Omit to have one generated.
+	Password *string                         `json:"password,omitempty"`
+	Phone    *string                         `json:"phone,omitempty"`
+	Role     PostApiV1OrgMembersJSONBodyRole `json:"role"`
+}
+
+// PostApiV1OrgMembersParams defines parameters for PostApiV1OrgMembers.
+type PostApiV1OrgMembersParams struct {
+	// XOrganizationId The organization to act within. Client-supplied and never trusted: every
+	// `/org/*` request re-reads the caller's membership from the database
+	// before any org-scoped data is touched.
+	XOrganizationId OrganizationId `json:"x-organization-id"`
+}
+
+// PostApiV1OrgMembersJSONBodyRole defines parameters for PostApiV1OrgMembers.
+type PostApiV1OrgMembersJSONBodyRole string
+
 // DeleteApiV1OrgMembersUserIdParams defines parameters for DeleteApiV1OrgMembersUserId.
 type DeleteApiV1OrgMembersUserIdParams struct {
 	// XOrganizationId The organization to act within. Client-supplied and never trusted: every
@@ -1394,11 +1529,27 @@ type DeleteApiV1OrgScheduleExceptionsExceptionIdParams struct {
 
 // GetApiV1OrgServicesParams defines parameters for GetApiV1OrgServices.
 type GetApiV1OrgServicesParams struct {
+	// Search Matches name or description, case-insensitively.
+	Search *string `form:"search,omitempty" json:"search,omitempty"`
+
+	// IsActive Omit for either.
+	IsActive   *GetApiV1OrgServicesParamsIsActive `form:"isActive,omitempty" json:"isActive,omitempty"`
+	CategoryId *openapi_types.UUID                `form:"categoryId,omitempty" json:"categoryId,omitempty"`
+	Sort       *GetApiV1OrgServicesParamsSort     `form:"sort,omitempty" json:"sort,omitempty"`
+	Limit      *int                               `form:"limit,omitempty" json:"limit,omitempty"`
+	Offset     *int                               `form:"offset,omitempty" json:"offset,omitempty"`
+
 	// XOrganizationId The organization to act within. Client-supplied and never trusted: every
 	// `/org/*` request re-reads the caller's membership from the database
 	// before any org-scoped data is touched.
 	XOrganizationId OrganizationId `json:"x-organization-id"`
 }
+
+// GetApiV1OrgServicesParamsIsActive defines parameters for GetApiV1OrgServices.
+type GetApiV1OrgServicesParamsIsActive string
+
+// GetApiV1OrgServicesParamsSort defines parameters for GetApiV1OrgServices.
+type GetApiV1OrgServicesParamsSort string
 
 // PostApiV1OrgServicesParams defines parameters for PostApiV1OrgServices.
 type PostApiV1OrgServicesParams struct {
@@ -1426,6 +1577,50 @@ type GetApiV1OrgServicesServiceIdParams struct {
 
 // PatchApiV1OrgServicesServiceIdParams defines parameters for PatchApiV1OrgServicesServiceId.
 type PatchApiV1OrgServicesServiceIdParams struct {
+	// XOrganizationId The organization to act within. Client-supplied and never trusted: every
+	// `/org/*` request re-reads the caller's membership from the database
+	// before any org-scoped data is touched.
+	XOrganizationId OrganizationId `json:"x-organization-id"`
+}
+
+// GetApiV1OrgServicesServiceIdMediaParams defines parameters for GetApiV1OrgServicesServiceIdMedia.
+type GetApiV1OrgServicesServiceIdMediaParams struct {
+	// XOrganizationId The organization to act within. Client-supplied and never trusted: every
+	// `/org/*` request re-reads the caller's membership from the database
+	// before any org-scoped data is touched.
+	XOrganizationId OrganizationId `json:"x-organization-id"`
+}
+
+// PostApiV1OrgServicesServiceIdMediaMultipartBody defines parameters for PostApiV1OrgServicesServiceIdMedia.
+type PostApiV1OrgServicesServiceIdMediaMultipartBody struct {
+	Caption *string            `json:"caption,omitempty"`
+	File    openapi_types.File `json:"file"`
+}
+
+// PostApiV1OrgServicesServiceIdMediaParams defines parameters for PostApiV1OrgServicesServiceIdMedia.
+type PostApiV1OrgServicesServiceIdMediaParams struct {
+	// XOrganizationId The organization to act within. Client-supplied and never trusted: every
+	// `/org/*` request re-reads the caller's membership from the database
+	// before any org-scoped data is touched.
+	XOrganizationId OrganizationId `json:"x-organization-id"`
+}
+
+// DeleteApiV1OrgServicesServiceIdMediaMediaIdParams defines parameters for DeleteApiV1OrgServicesServiceIdMediaMediaId.
+type DeleteApiV1OrgServicesServiceIdMediaMediaIdParams struct {
+	// XOrganizationId The organization to act within. Client-supplied and never trusted: every
+	// `/org/*` request re-reads the caller's membership from the database
+	// before any org-scoped data is touched.
+	XOrganizationId OrganizationId `json:"x-organization-id"`
+}
+
+// PatchApiV1OrgServicesServiceIdMediaMediaIdJSONBody defines parameters for PatchApiV1OrgServicesServiceIdMediaMediaId.
+type PatchApiV1OrgServicesServiceIdMediaMediaIdJSONBody struct {
+	Caption   *string `json:"caption,omitempty"`
+	SortOrder *int    `json:"sortOrder,omitempty"`
+}
+
+// PatchApiV1OrgServicesServiceIdMediaMediaIdParams defines parameters for PatchApiV1OrgServicesServiceIdMediaMediaId.
+type PatchApiV1OrgServicesServiceIdMediaMediaIdParams struct {
 	// XOrganizationId The organization to act within. Client-supplied and never trusted: every
 	// `/org/*` request re-reads the caller's membership from the database
 	// before any org-scoped data is touched.
@@ -1488,6 +1683,14 @@ type PatchApiV1OrgServicesServiceIdOptionGroupsGroupIdOptionsOptionIdParams stru
 	XOrganizationId OrganizationId `json:"x-organization-id"`
 }
 
+// GetApiV1OrgStatsCatalogParams defines parameters for GetApiV1OrgStatsCatalog.
+type GetApiV1OrgStatsCatalogParams struct {
+	// XOrganizationId The organization to act within. Client-supplied and never trusted: every
+	// `/org/*` request re-reads the caller's membership from the database
+	// before any org-scoped data is touched.
+	XOrganizationId OrganizationId `json:"x-organization-id"`
+}
+
 // GetApiV1OrgStatsSummaryParams defines parameters for GetApiV1OrgStatsSummary.
 type GetApiV1OrgStatsSummaryParams struct {
 	From *openapi_types.Date `form:"from,omitempty" json:"from,omitempty"`
@@ -1537,6 +1740,9 @@ type PostApiV1AdminProvidersJSONRequestBody = CreateProviderRequest
 // PostApiV1AuthRefreshJSONRequestBody defines body for PostApiV1AuthRefresh for application/json ContentType.
 type PostApiV1AuthRefreshJSONRequestBody = RefreshRequest
 
+// PostApiV1AuthResendVerificationJSONRequestBody defines body for PostApiV1AuthResendVerification for application/json ContentType.
+type PostApiV1AuthResendVerificationJSONRequestBody PostApiV1AuthResendVerificationJSONBody
+
 // PostApiV1AuthSignInJSONRequestBody defines body for PostApiV1AuthSignIn for application/json ContentType.
 type PostApiV1AuthSignInJSONRequestBody = SignInRequest
 
@@ -1545,6 +1751,9 @@ type PostApiV1AuthSignOutJSONRequestBody = RefreshRequest
 
 // PostApiV1AuthSignUpJSONRequestBody defines body for PostApiV1AuthSignUp for application/json ContentType.
 type PostApiV1AuthSignUpJSONRequestBody = SignUpRequest
+
+// PostApiV1AuthVerifyEmailJSONRequestBody defines body for PostApiV1AuthVerifyEmail for application/json ContentType.
+type PostApiV1AuthVerifyEmailJSONRequestBody PostApiV1AuthVerifyEmailJSONBody
 
 // PostApiV1MeBookingsJSONRequestBody defines body for PostApiV1MeBookings for application/json ContentType.
 type PostApiV1MeBookingsJSONRequestBody = CreateBookingRequest
@@ -1579,6 +1788,9 @@ type PatchApiV1OrgBusinessHoursHoursIdJSONRequestBody PatchApiV1OrgBusinessHours
 // PostApiV1OrgInvitationsJSONRequestBody defines body for PostApiV1OrgInvitations for application/json ContentType.
 type PostApiV1OrgInvitationsJSONRequestBody PostApiV1OrgInvitationsJSONBody
 
+// PostApiV1OrgMembersJSONRequestBody defines body for PostApiV1OrgMembers for application/json ContentType.
+type PostApiV1OrgMembersJSONRequestBody PostApiV1OrgMembersJSONBody
+
 // PatchApiV1OrgMembersUserIdJSONRequestBody defines body for PatchApiV1OrgMembersUserId for application/json ContentType.
 type PatchApiV1OrgMembersUserIdJSONRequestBody PatchApiV1OrgMembersUserIdJSONBody
 
@@ -1599,6 +1811,12 @@ type PostApiV1OrgServicesJSONRequestBody = CreateServiceRequest
 
 // PatchApiV1OrgServicesServiceIdJSONRequestBody defines body for PatchApiV1OrgServicesServiceId for application/json ContentType.
 type PatchApiV1OrgServicesServiceIdJSONRequestBody = UpdateServiceRequest
+
+// PostApiV1OrgServicesServiceIdMediaMultipartRequestBody defines body for PostApiV1OrgServicesServiceIdMedia for multipart/form-data ContentType.
+type PostApiV1OrgServicesServiceIdMediaMultipartRequestBody PostApiV1OrgServicesServiceIdMediaMultipartBody
+
+// PatchApiV1OrgServicesServiceIdMediaMediaIdJSONRequestBody defines body for PatchApiV1OrgServicesServiceIdMediaMediaId for application/json ContentType.
+type PatchApiV1OrgServicesServiceIdMediaMediaIdJSONRequestBody PatchApiV1OrgServicesServiceIdMediaMediaIdJSONBody
 
 // PostApiV1OrgServicesServiceIdOptionGroupsJSONRequestBody defines body for PostApiV1OrgServicesServiceIdOptionGroups for application/json ContentType.
 type PostApiV1OrgServicesServiceIdOptionGroupsJSONRequestBody = CreateOptionGroupRequest

@@ -16,6 +16,7 @@ import (
 	"github.com/nearby/booking-backend/internal/booking"
 	"github.com/nearby/booking-backend/internal/catalog"
 	httpapi "github.com/nearby/booking-backend/internal/http"
+	"github.com/nearby/booking-backend/internal/media"
 	"github.com/nearby/booking-backend/internal/platform/config"
 	"github.com/nearby/booking-backend/internal/platform/database"
 	"github.com/nearby/booking-backend/internal/platform/logging"
@@ -68,7 +69,42 @@ func run() error {
 	// the catalog implements it, so the slot generator never learns what a
 	// category is.
 	issuer := auth.NewTokenIssuer(cfg.JWTSecret, cfg.JWTIssuer, cfg.AccessTokenTTL)
-	authService := auth.NewService(pool, issuer, cfg.RefreshTokenTTLWeb, cfg.RefreshTokenTTLMobile)
+
+	// Verification codes have nowhere to go until an SMS or email provider is
+	// configured, so for now they are written to the log. Replacing this one
+	// line with a real auth.CodeSender is the entire integration.
+	codeSender := auth.NewLogCodeSender(logger)
+
+	authService := auth.NewService(pool, issuer, codeSender, logger,
+		cfg.RefreshTokenTTLWeb, cfg.RefreshTokenTTLMobile)
+	// Storage is a port: everything above it is written against the interface,
+	// so this block is the whole of the local-vs-hosted decision.
+	var mediaStorage media.Storage
+	var localMedia *media.LocalStorage
+
+	cloudinary := media.NewCloudinaryStorage(
+		cfg.CloudinaryCloudName, cfg.CloudinaryAPIKey,
+		cfg.CloudinaryAPISecret, cfg.CloudinaryUploadFolder)
+
+	if cloudinary.Configured() {
+		mediaStorage = cloudinary
+		logger.Info("media: uploads go to cloudinary",
+			slog.String("cloud", cfg.CloudinaryCloudName))
+	} else {
+		local, err := media.NewLocalStorage(cfg.MediaLocalDir, "/media")
+		if err != nil {
+			logger.Error("media: cannot prepare upload directory",
+				slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+		mediaStorage, localMedia = local, local
+		// Warn, not info: this is fine on a laptop and wrong in production,
+		// and the difference is invisible until the container restarts.
+		logger.Warn("media: uploads are on local disk — ephemeral and single-node; set CLOUDINARY_* for hosted storage",
+			slog.String("dir", cfg.MediaLocalDir))
+	}
+
+	mediaService := media.NewService(pool, mediaStorage, logger)
 	tenantService := tenant.NewService(pool, cfg.DefaultTimezone, cfg.MinLeadMinutes)
 	catalogService := catalog.New(pool)
 	scheduler := scheduling.New(pool, catalogService, scheduling.Options{
@@ -78,12 +114,14 @@ func run() error {
 	bookingService := booking.NewService(pool, catalogService, scheduler)
 
 	handler := httpapi.NewRouter(cfg, logger, pool, httpapi.Services{
-		Auth:      authService,
-		Tenant:    tenantService,
-		Catalog:   catalogService,
-		Scheduler: scheduler,
-		Booking:   bookingService,
-		Issuer:    issuer,
+		Auth:       authService,
+		Tenant:     tenantService,
+		Catalog:    catalogService,
+		Scheduler:  scheduler,
+		Booking:    bookingService,
+		Media:      mediaService,
+		LocalMedia: localMedia,
+		Issuer:     issuer,
 	})
 
 	server := &http.Server{

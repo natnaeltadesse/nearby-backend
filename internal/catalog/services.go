@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -146,7 +147,8 @@ func (c *Catalog) GetServiceWithProvider(ctx context.Context, id uuid.UUID) (*Se
 	}, nil
 }
 
-// ListServices returns a provider's services.
+// ListServices returns a provider's services, unpaginated and sorted by name.
+// The public surface uses it, where the whole active catalog is the answer.
 func (c *Catalog) ListServices(ctx context.Context, providerID uuid.UUID, activeOnly bool) ([]Service, error) {
 	rows, err := c.queries.ListServicesByProvider(ctx, db.ListServicesByProviderParams{
 		ProviderID: providerID,
@@ -165,6 +167,119 @@ func (c *Catalog) ListServices(ctx context.Context, providerID uuid.UUID, active
 		services = append(services, *service)
 	}
 	return services, nil
+}
+
+// Sort keys accepted by ListServicesPage. Anything else is a client error
+// rather than a silent fallback: a table that quietly ignores the column you
+// clicked is worse than one that tells you it cannot sort by it.
+const (
+	SortByName     = "name"
+	SortByCategory = "category"
+	SortByPrice    = "price"
+	SortByDuration = "duration"
+	SortByCreated  = "created"
+)
+
+// ValidServiceSort reports whether key is a sortable column.
+func ValidServiceSort(key string) bool {
+	switch key {
+	case SortByName, SortByCategory, SortByPrice, SortByDuration, SortByCreated:
+		return true
+	}
+	return false
+}
+
+// ListServicesInput is the org catalog list: search, filter, sort, paginate.
+type ListServicesInput struct {
+	Search string
+	// Nil means "either"; the org surface shows inactive services too, so this
+	// is a filter rather than the public surface's fixed activeOnly.
+	IsActive   *bool
+	CategoryID *uuid.UUID
+	SortBy     string
+	SortDesc   bool
+	Limit      int32
+	Offset     int32
+}
+
+// ListServicesPage answers the provider dashboard's table. Searching, sorting
+// and paging all happen in Postgres, so the client never has to hold the whole
+// catalog to filter it, and the numbers it shows are the real totals rather
+// than the size of whatever page it happens to have.
+func (c *Catalog) ListServicesPage(
+	ctx context.Context,
+	providerID uuid.UUID,
+	in ListServicesInput,
+) ([]Service, int64, error) {
+	sortBy := in.SortBy
+	if sortBy == "" {
+		sortBy = SortByName
+	}
+	if !ValidServiceSort(sortBy) {
+		return nil, 0, httpx.Validation(
+			"sort must be one of: name, category, price, duration, created")
+	}
+
+	if in.Limit <= 0 {
+		in.Limit = 25
+	}
+	if in.Limit > 100 {
+		in.Limit = 100
+	}
+	if in.Offset < 0 {
+		in.Offset = 0
+	}
+
+	rows, err := c.queries.ListServicesPage(ctx, db.ListServicesPageParams{
+		ProviderID:   providerID,
+		IsActive:     in.IsActive,
+		CategoryID:   in.CategoryID,
+		Search:       strings.TrimSpace(in.Search),
+		SortBy:       sortBy,
+		SortDesc:     in.SortDesc,
+		ResultLimit:  in.Limit,
+		ResultOffset: in.Offset,
+	})
+	if err != nil {
+		return nil, 0, httpx.Internal(err)
+	}
+
+	total, err := c.queries.CountServicesPage(ctx, db.CountServicesPageParams{
+		ProviderID: providerID,
+		IsActive:   in.IsActive,
+		CategoryID: in.CategoryID,
+		Search:     strings.TrimSpace(in.Search),
+	})
+	if err != nil {
+		return nil, 0, httpx.Internal(err)
+	}
+
+	services := make([]Service, 0, len(rows))
+	for _, row := range rows {
+		attributes, err := decodeAttributes(row.Attributes)
+		if err != nil {
+			return nil, 0, httpx.Internal(err)
+		}
+
+		services = append(services, Service{
+			ID:              row.ID,
+			ProviderID:      row.ProviderID,
+			CategoryID:      row.CategoryID,
+			CategoryName:    row.CategoryName,
+			Name:            row.Name,
+			Description:     row.Description,
+			PriceCents:      row.PriceCents,
+			Currency:        row.Currency,
+			DurationMinutes: row.DurationMinutes,
+			BufferMinutes:   row.BufferMinutes,
+			Attributes:      attributes,
+			ImageURL:        row.ImageUrl,
+			IsActive:        row.IsActive,
+			CreatedAt:       row.CreatedAt,
+			UpdatedAt:       row.UpdatedAt,
+		})
+	}
+	return services, total, nil
 }
 
 // UpdateServiceInput patches a service.
@@ -316,4 +431,130 @@ func serviceFromRow(row db.Service) (*Service, error) {
 		CreatedAt:       row.CreatedAt,
 		UpdatedAt:       row.UpdatedAt,
 	}, nil
+}
+
+// CatalogCategoryCount is one bar in the dashboard's category breakdown.
+type CatalogCategoryCount struct {
+	CategoryID   uuid.UUID `json:"categoryId"`
+	CategoryName *string   `json:"categoryName,omitempty"`
+	Count        int64     `json:"count"`
+}
+
+// CatalogStats are the headline figures above the services table.
+//
+// Deliberately unfiltered: these describe the whole catalog, while the table
+// under them describes whatever the current query is. Mixing the two would
+// make the cards move every time someone typed in the search box, which is
+// the opposite of what a stable reference figure is for.
+type CatalogStats struct {
+	Total  int64 `json:"total"`
+	Active int64 `json:"active"`
+	Hidden int64 `json:"hidden"`
+
+	PriceMinCents int32 `json:"priceMinCents"`
+	PriceMaxCents int32 `json:"priceMaxCents"`
+	PriceAvgCents int32 `json:"priceAvgCents"`
+
+	DurationMinMinutes int32 `json:"durationMinMinutes"`
+	DurationMaxMinutes int32 `json:"durationMaxMinutes"`
+	DurationAvgMinutes int32 `json:"durationAvgMinutes"`
+
+	ByCategory []CatalogCategoryCount `json:"byCategory"`
+	Growth     CatalogGrowth          `json:"growth"`
+}
+
+// CatalogGrowth is the rolling window behind the growth chart.
+type CatalogGrowth struct {
+	// PriorTotal is what existed before the window opened, so a running total
+	// drawn from Months starts at the truth instead of at zero.
+	PriorTotal int64                `json:"priorTotal"`
+	Months     []CatalogMonthlyAdds `json:"months"`
+}
+
+// CatalogMonthlyAdds is one month's worth of new services.
+type CatalogMonthlyAdds struct {
+	// Month is the first day of the month, as a plain date.
+	Month string `json:"month"`
+	Added int64  `json:"added"`
+}
+
+// growthWindowMonths is how far back the growth chart looks. Six points is
+// enough to read a direction without the marks getting too thin to hit.
+const growthWindowMonths = 5
+
+// CatalogStats aggregates a provider's catalog in the database rather than
+// shipping every row to the client to be counted there.
+func (c *Catalog) CatalogStats(ctx context.Context, providerID uuid.UUID) (*CatalogStats, error) {
+	row, err := c.queries.ServiceCatalogStats(ctx, providerID)
+	if err != nil {
+		return nil, httpx.Internal(err)
+	}
+
+	byCategory, err := c.queries.ServiceCountByCategory(ctx, providerID)
+	if err != nil {
+		return nil, httpx.Internal(err)
+	}
+
+	stats := &CatalogStats{
+		Total:              row.Total,
+		Active:             row.Active,
+		Hidden:             row.Total - row.Active,
+		PriceMinCents:      row.PriceMinCents,
+		PriceMaxCents:      row.PriceMaxCents,
+		PriceAvgCents:      row.PriceAvgCents,
+		DurationMinMinutes: row.DurationMinMinutes,
+		DurationMaxMinutes: row.DurationMaxMinutes,
+		DurationAvgMinutes: row.DurationAvgMinutes,
+		ByCategory:         make([]CatalogCategoryCount, 0, len(byCategory)),
+	}
+
+	for _, entry := range byCategory {
+		stats.ByCategory = append(stats.ByCategory, CatalogCategoryCount{
+			CategoryID:   entry.CategoryID,
+			CategoryName: entry.CategoryName,
+			Count:        entry.ServiceCount,
+		})
+	}
+
+	priorTotal, err := c.queries.ServicesCreatedBefore(ctx, db.ServicesCreatedBeforeParams{
+		ProviderID: providerID,
+		MonthsBack: growthWindowMonths,
+	})
+	if err != nil {
+		return nil, httpx.Internal(err)
+	}
+
+	monthly, err := c.queries.ServicesAddedByMonth(ctx, db.ServicesAddedByMonthParams{
+		ProviderID: providerID,
+		MonthsBack: growthWindowMonths,
+	})
+	if err != nil {
+		return nil, httpx.Internal(err)
+	}
+
+	// Months with nothing added return no row, but a gap in a time series
+	// reads as a change in slope that never happened — so the window is
+	// filled in here rather than left for each client to reinvent.
+	added := make(map[string]int64, len(monthly))
+	for _, entry := range monthly {
+		added[entry.Month.Format("2006-01-02")] = entry.Added
+	}
+
+	start := time.Now().UTC()
+	start = time.Date(start.Year(), start.Month(), 1, 0, 0, 0, 0, time.UTC).
+		AddDate(0, -growthWindowMonths, 0)
+
+	stats.Growth = CatalogGrowth{
+		PriorTotal: priorTotal,
+		Months:     make([]CatalogMonthlyAdds, 0, growthWindowMonths+1),
+	}
+	for i := 0; i <= growthWindowMonths; i++ {
+		key := start.AddDate(0, i, 0).Format("2006-01-02")
+		stats.Growth.Months = append(stats.Growth.Months, CatalogMonthlyAdds{
+			Month: key,
+			Added: added[key],
+		})
+	}
+
+	return stats, nil
 }

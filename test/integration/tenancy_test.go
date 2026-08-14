@@ -236,6 +236,84 @@ func TestIntegrationInvitationFlow(t *testing.T) {
 	})
 }
 
+// The other way onto a team: the owner creates the account outright and hands
+// the credentials over, instead of mailing an invitation.
+func TestIntegrationOwnerCreatesStaffAccounts(t *testing.T) {
+	s := newServer(t)
+	f := newFixture(t, s, "instant")
+	orgAuth := f.orgAuth()
+
+	t.Run("with a password the owner chose", func(t *testing.T) {
+		resp := s.post(t, "/api/v1/org/members", map[string]any{
+			"name":     "Selam Tesfaye",
+			"email":    "selam@shinewash.et",
+			"password": "chosen-by-owner",
+			"role":     "admin",
+		}, orgAuth...)
+		requireStatus(t, resp, http.StatusCreated)
+
+		member := resp.Body["member"].(map[string]any)
+		assert.Equal(t, "admin", member["role"])
+		assert.Equal(t, "selam@shinewash.et", member["email"])
+		assert.NotContains(t, resp.Body, "generatedPassword",
+			"a password the caller supplied is not echoed back")
+
+		// The account is real: those credentials open the org surface.
+		created := s.signInWith(t, "selam@shinewash.et", "chosen-by-owner")
+		requireStatus(t, s.get(t, "/api/v1/org/profile",
+			withToken(created.AccessToken), withOrg(f.providerID)), http.StatusOK)
+	})
+
+	t.Run("with a password the server generated", func(t *testing.T) {
+		resp := s.post(t, "/api/v1/org/members", map[string]any{
+			"name":  "Yonas Alemu",
+			"email": "yonas@shinewash.et",
+			"role":  "staff",
+		}, orgAuth...)
+		requireStatus(t, resp, http.StatusCreated)
+
+		password, ok := resp.Body["generatedPassword"].(string)
+		require.True(t, ok, "the generated password is returned so it can be handed over")
+		require.NotEmpty(t, password)
+
+		created := s.signInWith(t, "yonas@shinewash.et", password)
+		requireStatus(t, s.get(t, "/api/v1/org/profile",
+			withToken(created.AccessToken), withOrg(f.providerID)), http.StatusOK)
+
+		// It was hashed on the way in, so it is not readable a second time.
+		list := s.get(t, "/api/v1/org/members", orgAuth...)
+		requireStatus(t, list, http.StatusOK)
+		assert.NotContains(t, list.Raw, password)
+	})
+
+	t.Run("an address that already has an account is refused", func(t *testing.T) {
+		resp := s.post(t, "/api/v1/org/members", map[string]any{
+			"name":  "Someone Else",
+			"email": f.owner.Email,
+			"role":  "staff",
+		}, orgAuth...)
+		requireError(t, resp, http.StatusConflict, "CONFLICT")
+	})
+
+	t.Run("a new account cannot start as an owner", func(t *testing.T) {
+		resp := s.post(t, "/api/v1/org/members", map[string]any{
+			"name":  "Would-be Owner",
+			"email": "wouldbe@shinewash.et",
+			"role":  "owner",
+		}, orgAuth...)
+		requireError(t, resp, http.StatusUnprocessableEntity, "VALIDATION_ERROR")
+	})
+
+	// A failed creation must not leave a usable login behind: the user row and
+	// the membership go in together or not at all.
+	t.Run("a rejected role leaves no orphaned account", func(t *testing.T) {
+		var exists bool
+		require.NoError(t, testPool.QueryRow(t.Context(),
+			`SELECT exists(SELECT 1 FROM users WHERE email = 'wouldbe@shinewash.et')`).Scan(&exists))
+		assert.False(t, exists)
+	})
+}
+
 func TestIntegrationRoleGatingWithinAnOrg(t *testing.T) {
 	s := newServer(t)
 	f := newFixture(t, s, "instant")
@@ -264,9 +342,13 @@ func TestIntegrationRoleGatingWithinAnOrg(t *testing.T) {
 		map[string]any{"email": "x@example.et", "role": "staff"}, staffAuth...),
 		http.StatusForbidden, "FORBIDDEN")
 
-	// Removing a member is owner-only, so even an admin cannot.
+	// Removing a member, or creating one outright, is owner-only.
 	requireError(t, s.delete(t, "/api/v1/org/members/"+f.owner.ID, staffAuth...),
 		http.StatusForbidden, "FORBIDDEN")
+
+	requireError(t, s.post(t, "/api/v1/org/members", map[string]any{
+		"name": "Hire", "email": "hire@example.et", "role": "staff",
+	}, staffAuth...), http.StatusForbidden, "FORBIDDEN")
 }
 
 // A provider must never be left with nobody who can administer it.

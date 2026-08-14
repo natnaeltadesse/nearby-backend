@@ -367,3 +367,190 @@ func TestIntegrationServiceUpdateRevalidatesAttributes(t *testing.T) {
 	requireStatus(t, good, http.StatusOK)
 	assert.Equal(t, map[string]any{"wash_type": "interior"}, good.Body["attributes"])
 }
+
+// The org catalog list does its searching, filtering, sorting and paging in
+// Postgres, so the client never has to hold the whole catalog to narrow it.
+func TestIntegrationServiceListIsQueriedServerSide(t *testing.T) {
+	s := newServer(t)
+	f := newFixture(t, s, "instant")
+	orgAuth := f.orgAuth()
+
+	// The fixture already has "Exterior wash" at 24500 / 45 min.
+	for _, extra := range []map[string]any{
+		{"name": "Alloy polish", "priceCents": 9000, "durationMinutes": 20},
+		{"name": "Full valet", "priceCents": 50000, "durationMinutes": 90},
+	} {
+		resp := s.post(t, "/api/v1/org/services", map[string]any{
+			"categoryId":      f.categoryID,
+			"name":            extra["name"],
+			"priceCents":      extra["priceCents"],
+			"durationMinutes": extra["durationMinutes"],
+			"attributes":      map[string]any{},
+		}, orgAuth...)
+		requireStatus(t, resp, http.StatusCreated)
+	}
+
+	// Hide one, so the isActive filter has something to bite on.
+	hidden := s.post(t, "/api/v1/org/services", map[string]any{
+		"categoryId": f.categoryID, "name": "Retired wash",
+		"priceCents": 100, "durationMinutes": 10,
+		"attributes": map[string]any{}, "isActive": false,
+	}, orgAuth...)
+	requireStatus(t, hidden, http.StatusCreated)
+
+	names := func(resp response) []string {
+		t.Helper()
+		list, _ := resp.Body["services"].([]any)
+		out := make([]string, 0, len(list))
+		for _, item := range list {
+			out = append(out, item.(map[string]any)["name"].(string))
+		}
+		return out
+	}
+
+	t.Run("the envelope carries the real total, not the page size", func(t *testing.T) {
+		resp := s.get(t, "/api/v1/org/services?limit=2", orgAuth...)
+		requireStatus(t, resp, http.StatusOK)
+		assert.Len(t, names(resp), 2)
+		assert.Equal(t, float64(4), resp.Body["total"])
+	})
+
+	t.Run("search matches name and description", func(t *testing.T) {
+		resp := s.get(t, "/api/v1/org/services?search=valet", orgAuth...)
+		requireStatus(t, resp, http.StatusOK)
+		assert.Equal(t, []string{"Full valet"}, names(resp))
+		assert.Equal(t, float64(1), resp.Body["total"], "the total reflects the search")
+	})
+
+	t.Run("isActive filters", func(t *testing.T) {
+		resp := s.get(t, "/api/v1/org/services?isActive=false", orgAuth...)
+		requireStatus(t, resp, http.StatusOK)
+		assert.Equal(t, []string{"Retired wash"}, names(resp))
+
+		resp = s.get(t, "/api/v1/org/services?isActive=true", orgAuth...)
+		requireStatus(t, resp, http.StatusOK)
+		assert.NotContains(t, names(resp), "Retired wash")
+	})
+
+	t.Run("sorting is applied in the database", func(t *testing.T) {
+		resp := s.get(t, "/api/v1/org/services?sort=price", orgAuth...)
+		requireStatus(t, resp, http.StatusOK)
+		assert.Equal(t,
+			[]string{"Retired wash", "Alloy polish", "Exterior wash", "Full valet"},
+			names(resp))
+
+		resp = s.get(t, "/api/v1/org/services?sort=-price", orgAuth...)
+		requireStatus(t, resp, http.StatusOK)
+		assert.Equal(t,
+			[]string{"Full valet", "Exterior wash", "Alloy polish", "Retired wash"},
+			names(resp))
+
+		resp = s.get(t, "/api/v1/org/services?sort=-duration", orgAuth...)
+		requireStatus(t, resp, http.StatusOK)
+		assert.Equal(t, "Full valet", names(resp)[0])
+	})
+
+	t.Run("paging with a sort does not repeat or skip a row", func(t *testing.T) {
+		seen := map[string]bool{}
+		for offset := 0; offset < 4; offset += 2 {
+			resp := s.get(t,
+				fmt.Sprintf("/api/v1/org/services?sort=name&limit=2&offset=%d", offset),
+				orgAuth...)
+			requireStatus(t, resp, http.StatusOK)
+			for _, name := range names(resp) {
+				assert.False(t, seen[name], "%s appeared on two pages", name)
+				seen[name] = true
+			}
+		}
+		assert.Len(t, seen, 4)
+	})
+
+	t.Run("an unknown sort key is refused rather than ignored", func(t *testing.T) {
+		requireError(t, s.get(t, "/api/v1/org/services?sort=priceCents", orgAuth...),
+			http.StatusUnprocessableEntity, "VALIDATION_ERROR")
+	})
+
+	t.Run("the category name rides along so the client need not join", func(t *testing.T) {
+		resp := s.get(t, "/api/v1/org/services?limit=1", orgAuth...)
+		requireStatus(t, resp, http.StatusOK)
+		first := resp.Body["services"].([]any)[0].(map[string]any)
+		assert.Equal(t, "Car wash", first["categoryName"])
+	})
+}
+
+// The stat cards above the services table read catalog-wide figures, computed
+// in the database rather than by counting rows in the browser.
+func TestIntegrationCatalogStats(t *testing.T) {
+	s := newServer(t)
+	f := newFixture(t, s, "instant")
+	orgAuth := f.orgAuth()
+
+	// Fixture has "Exterior wash" at 24500 / 45min, active.
+	add := func(name string, price, minutes int, active bool) {
+		t.Helper()
+		resp := s.post(t, "/api/v1/org/services", map[string]any{
+			"categoryId": f.categoryID, "name": name,
+			"priceCents": price, "durationMinutes": minutes,
+			"isActive": active, "attributes": map[string]any{},
+		}, orgAuth...)
+		requireStatus(t, resp, http.StatusCreated)
+	}
+	add("Cheap rinse", 500, 15, true)
+	add("Retired wash", 100, 5, false)
+
+	resp := s.get(t, "/api/v1/org/stats/catalog", orgAuth...)
+	requireStatus(t, resp, http.StatusOK)
+
+	assert.Equal(t, float64(3), resp.Body["total"])
+	assert.Equal(t, float64(2), resp.Body["active"])
+	assert.Equal(t, float64(1), resp.Body["hidden"], "hidden is derived, not counted twice")
+
+	// Hidden services still count towards the catalog's range: they are part of
+	// the catalog, just not on sale.
+	assert.Equal(t, float64(100), resp.Body["priceMinCents"])
+	assert.Equal(t, float64(24500), resp.Body["priceMaxCents"])
+	assert.Equal(t, float64(8367), resp.Body["priceAvgCents"], "rounded, not truncated")
+
+	assert.Equal(t, float64(5), resp.Body["durationMinMinutes"])
+	assert.Equal(t, float64(45), resp.Body["durationMaxMinutes"])
+
+	byCategory := resp.Body["byCategory"].([]any)
+	require.Len(t, byCategory, 1)
+	first := byCategory[0].(map[string]any)
+	assert.Equal(t, "Car wash", first["categoryName"])
+	assert.Equal(t, float64(3), first["count"])
+
+	// The growth window is filled in month by month: a gap in a time series
+	// reads as a change in slope that never happened.
+	growth := resp.Body["growth"].(map[string]any)
+	months := growth["months"].([]any)
+	assert.Len(t, months, 6, "a six-point rolling window, gaps included")
+
+	var totalAdded float64
+	for _, month := range months {
+		totalAdded += month.(map[string]any)["added"].(float64)
+	}
+	assert.Equal(t, float64(3), totalAdded, "everything was created just now")
+	assert.Equal(t, float64(0), growth["priorTotal"])
+}
+
+// An empty catalog must not produce nulls the client has to guard against.
+func TestIntegrationCatalogStatsOnEmptyCatalog(t *testing.T) {
+	s := newServer(t)
+
+	owner := s.signUp(t, "Owner", "empty@example.et")
+	created := s.post(t, "/api/v1/me/providers",
+		map[string]any{"name": "Empty Co"}, withToken(owner.AccessToken))
+	requireStatus(t, created, http.StatusCreated)
+	providerID := created.Body["id"].(string)
+
+	owner = s.signIn(t, owner.Email)
+	resp := s.get(t, "/api/v1/org/stats/catalog",
+		withToken(owner.AccessToken), withOrg(providerID))
+	requireStatus(t, resp, http.StatusOK)
+
+	assert.Equal(t, float64(0), resp.Body["total"])
+	assert.Equal(t, float64(0), resp.Body["priceAvgCents"])
+	assert.Equal(t, float64(0), resp.Body["priceMinCents"])
+	assert.Empty(t, resp.Body["byCategory"])
+}

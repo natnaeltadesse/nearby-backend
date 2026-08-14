@@ -364,6 +364,119 @@ func (s *Service) ListMembers(ctx context.Context, providerID uuid.UUID) ([]Memb
 	return members, nil
 }
 
+// CreateMemberInput provisions a staff account from the org side.
+type CreateMemberInput struct {
+	Name  string  `json:"name"`
+	Email string  `json:"email"`
+	Phone *string `json:"phone"`
+	// Password is optional: leaving it out has the server generate one and
+	// return it in the response, which is the only time it is ever readable.
+	Password *string `json:"password"`
+	Role     string  `json:"role"`
+}
+
+// CreateMember creates a login for someone the org is hiring and makes them a
+// member, both in one transaction — a user row created here has no purpose
+// outside the membership, so a half-applied version of this is worse than none.
+//
+// This is the counterpart to CreateInvitation, for the common case where the
+// owner is sitting next to the new employee and will hand over the credentials
+// themselves. Invitations remain the right tool when the person already has an
+// account, which is why an address that is already registered is refused here
+// rather than quietly attached: joining an org is the account holder's
+// decision, not the owner's.
+//
+// Promotion to owner deliberately is not available at creation time. Handing
+// out full control of a tenant should be a deliberate second step through
+// UpdateMemberRole, not a field on a form filled in during onboarding.
+func (s *Service) CreateMember(ctx context.Context, providerID uuid.UUID, in CreateMemberInput) (*Member, string, error) {
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		return nil, "", httpx.Validation("Name is required")
+	}
+
+	email := auth.NormalizeEmail(in.Email)
+	if err := auth.ValidateEmail(email); err != nil {
+		return nil, "", err
+	}
+
+	switch in.Role {
+	case RoleAdmin, RoleStaff:
+	case RoleOwner:
+		return nil, "", httpx.Validation(
+			"A new account cannot start as an owner; create them as a manager first, then promote")
+	default:
+		return nil, "", httpx.Validation("role must be 'admin' or 'staff'")
+	}
+
+	// A generated password is returned to the caller; a supplied one never is,
+	// because whoever typed it already knows it.
+	password := ""
+	generated := ""
+	if in.Password != nil {
+		password = *in.Password
+		if err := auth.ValidatePassword(password); err != nil {
+			return nil, "", err
+		}
+	} else {
+		var err error
+		if generated, err = auth.GeneratePassword(); err != nil {
+			return nil, "", httpx.Internal(err)
+		}
+		password = generated
+	}
+
+	hash, err := auth.HashPassword(password)
+	if err != nil {
+		return nil, "", httpx.Internal(err)
+	}
+
+	var member *Member
+
+	err = database.InTx(ctx, s.pool, func(tx pgx.Tx) error {
+		q := s.queries.WithTx(tx)
+
+		user, err := q.CreateUser(ctx, db.CreateUserParams{
+			Name:         name,
+			Email:        email,
+			Phone:        trimPtr(in.Phone),
+			PasswordHash: hash,
+			PlatformRole: auth.RoleUser,
+		})
+		if err != nil {
+			if database.IsUniqueViolation(err) {
+				return httpx.Conflict(
+					"Someone already has an account with that email — invite them instead")
+			}
+			return httpx.Internal(err)
+		}
+
+		row, err := q.AddMember(ctx, db.AddMemberParams{
+			ProviderID: providerID,
+			UserID:     user.ID,
+			Role:       in.Role,
+		})
+		if err != nil {
+			return httpx.Internal(err)
+		}
+
+		member = &Member{
+			ProviderID: row.ProviderID,
+			UserID:     row.UserID,
+			Role:       row.Role,
+			Name:       user.Name,
+			Email:      user.Email,
+			Phone:      user.Phone,
+			CreatedAt:  row.CreatedAt,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return member, generated, nil
+}
+
 // UpdateMemberRole changes a member's role, refusing to demote the last owner.
 func (s *Service) UpdateMemberRole(ctx context.Context, providerID, userID uuid.UUID, role string) (*Member, error) {
 	if !ValidRole(role) {

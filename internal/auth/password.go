@@ -70,6 +70,42 @@ func VerifyPassword(password, encodedHash string) (bool, error) {
 	return subtle.ConstantTimeCompare(key, candidate) == 1, nil
 }
 
+// generatedPasswordAlphabet omits the characters that get misread when a
+// password is read off a screen and typed in by hand: 0/O, 1/l/I. A generated
+// password exists to be dictated to someone, so ambiguity is a real cost and
+// the four lost characters are not.
+const generatedPasswordAlphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+// GeneratedPasswordLength is long enough that dropping the ambiguous
+// characters still leaves ~70 bits of entropy.
+const GeneratedPasswordLength = 12
+
+// GeneratePassword returns a random password for an account someone else is
+// provisioning. Bytes at or above the largest multiple of the alphabet length
+// are discarded rather than folded, so every character stays equally likely.
+func GeneratePassword() (string, error) {
+	buf := make([]byte, GeneratedPasswordLength)
+	out := make([]byte, GeneratedPasswordLength)
+
+	for filled := 0; filled < GeneratedPasswordLength; {
+		if _, err := rand.Read(buf); err != nil {
+			return "", fmt.Errorf("auth: read password bytes: %w", err)
+		}
+		for _, b := range buf {
+			if int(b) >= 256-(256%len(generatedPasswordAlphabet)) {
+				continue // would bias the low end of the alphabet
+			}
+			out[filled] = generatedPasswordAlphabet[int(b)%len(generatedPasswordAlphabet)]
+			filled++
+			if filled == GeneratedPasswordLength {
+				break
+			}
+		}
+	}
+
+	return string(out), nil
+}
+
 // dummyHash is verified against when sign-in is given an unknown email, so the
 // response time does not reveal whether an account exists.
 var dummyHash = func() string {

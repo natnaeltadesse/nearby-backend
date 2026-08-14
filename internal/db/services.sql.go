@@ -7,9 +7,40 @@ package db
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
+
+const countServicesPage = `-- name: CountServicesPage :one
+SELECT count(*)
+FROM services s
+WHERE s.provider_id = $1
+  AND ($2::bool IS NULL OR s.is_active = $2)
+  AND ($3::uuid IS NULL OR s.category_id = $3)
+  AND ($4::text = ''
+       OR s.name ILIKE '%' || $4 || '%'
+       OR COALESCE(s.description, '') ILIKE '%' || $4 || '%')
+`
+
+type CountServicesPageParams struct {
+	ProviderID uuid.UUID
+	IsActive   *bool
+	CategoryID *uuid.UUID
+	Search     string
+}
+
+func (q *Queries) CountServicesPage(ctx context.Context, arg CountServicesPageParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countServicesPage,
+		arg.ProviderID,
+		arg.IsActive,
+		arg.CategoryID,
+		arg.Search,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
 
 const createService = `-- name: CreateService :one
 INSERT INTO services (
@@ -229,6 +260,259 @@ func (q *Queries) ListServicesByProvider(ctx context.Context, arg ListServicesBy
 		return nil, err
 	}
 	return items, nil
+}
+
+const listServicesPage = `-- name: ListServicesPage :many
+SELECT s.id, s.provider_id, s.category_id, c.name AS category_name,
+       s.name, s.description, s.price_cents, s.currency,
+       s.duration_minutes, s.buffer_minutes, s.attributes,
+       s.image_url, s.image_public_id, s.is_active, s.created_at, s.updated_at
+FROM services s
+LEFT JOIN categories c ON c.id = s.category_id
+WHERE s.provider_id = $1
+  AND ($2::bool IS NULL OR s.is_active = $2)
+  AND ($3::uuid IS NULL OR s.category_id = $3)
+  AND ($4::text = ''
+       OR s.name ILIKE '%' || $4 || '%'
+       OR COALESCE(s.description, '') ILIKE '%' || $4 || '%')
+ORDER BY
+    CASE WHEN $5::text = 'name'     AND NOT $6::bool THEN s.name END ASC,
+    CASE WHEN $5::text = 'name'     AND     $6::bool THEN s.name END DESC,
+    CASE WHEN $5::text = 'category' AND NOT $6::bool THEN c.name END ASC,
+    CASE WHEN $5::text = 'category' AND     $6::bool THEN c.name END DESC,
+    CASE WHEN $5::text = 'price'    AND NOT $6::bool THEN s.price_cents END ASC,
+    CASE WHEN $5::text = 'price'    AND     $6::bool THEN s.price_cents END DESC,
+    CASE WHEN $5::text = 'duration' AND NOT $6::bool THEN s.duration_minutes END ASC,
+    CASE WHEN $5::text = 'duration' AND     $6::bool THEN s.duration_minutes END DESC,
+    CASE WHEN $5::text = 'created'  AND NOT $6::bool THEN s.created_at END ASC,
+    CASE WHEN $5::text = 'created'  AND     $6::bool THEN s.created_at END DESC,
+    -- Ties broken by id so paging never repeats or skips a row: without a
+    -- total order, LIMIT/OFFSET can return the same row on two pages.
+    s.name ASC, s.id ASC
+LIMIT $8 OFFSET $7
+`
+
+type ListServicesPageParams struct {
+	ProviderID   uuid.UUID
+	IsActive     *bool
+	CategoryID   *uuid.UUID
+	Search       string
+	SortBy       string
+	SortDesc     bool
+	ResultOffset int32
+	ResultLimit  int32
+}
+
+type ListServicesPageRow struct {
+	ID              uuid.UUID
+	ProviderID      uuid.UUID
+	CategoryID      uuid.UUID
+	CategoryName    *string
+	Name            string
+	Description     *string
+	PriceCents      int32
+	Currency        string
+	DurationMinutes int32
+	BufferMinutes   int32
+	Attributes      []byte
+	ImageUrl        *string
+	ImagePublicID   *string
+	IsActive        bool
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+// The org catalog list: search, filter, sort and paginate, all in the
+// database. sqlc cannot interpolate an ORDER BY, so the sort key arrives as a
+// whitelisted string and is resolved by CASE — which keeps it a bound
+// parameter rather than concatenated SQL.
+//
+// The join is what lets `category` be a sortable column: sorting on
+// category_id would order by a uuid, which is nothing a reader recognises.
+func (q *Queries) ListServicesPage(ctx context.Context, arg ListServicesPageParams) ([]ListServicesPageRow, error) {
+	rows, err := q.db.Query(ctx, listServicesPage,
+		arg.ProviderID,
+		arg.IsActive,
+		arg.CategoryID,
+		arg.Search,
+		arg.SortBy,
+		arg.SortDesc,
+		arg.ResultOffset,
+		arg.ResultLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListServicesPageRow{}
+	for rows.Next() {
+		var i ListServicesPageRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.ProviderID,
+			&i.CategoryID,
+			&i.CategoryName,
+			&i.Name,
+			&i.Description,
+			&i.PriceCents,
+			&i.Currency,
+			&i.DurationMinutes,
+			&i.BufferMinutes,
+			&i.Attributes,
+			&i.ImageUrl,
+			&i.ImagePublicID,
+			&i.IsActive,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const serviceCatalogStats = `-- name: ServiceCatalogStats :one
+SELECT
+    count(*)::bigint                                          AS total,
+    count(*) FILTER (WHERE is_active)::bigint                 AS active,
+    COALESCE(min(price_cents), 0)::int                        AS price_min_cents,
+    COALESCE(max(price_cents), 0)::int                        AS price_max_cents,
+    COALESCE(round(avg(price_cents)), 0)::int                 AS price_avg_cents,
+    COALESCE(min(duration_minutes), 0)::int                   AS duration_min_minutes,
+    COALESCE(max(duration_minutes), 0)::int                   AS duration_max_minutes,
+    COALESCE(round(avg(duration_minutes)), 0)::int            AS duration_avg_minutes
+FROM services
+WHERE provider_id = $1
+`
+
+type ServiceCatalogStatsRow struct {
+	Total              int64
+	Active             int64
+	PriceMinCents      int32
+	PriceMaxCents      int32
+	PriceAvgCents      int32
+	DurationMinMinutes int32
+	DurationMaxMinutes int32
+	DurationAvgMinutes int32
+}
+
+// Catalog-wide figures for the provider dashboard's stat cards. Deliberately
+// unfiltered: these describe the whole catalog, while the table beneath them
+// describes the current query.
+func (q *Queries) ServiceCatalogStats(ctx context.Context, providerID uuid.UUID) (ServiceCatalogStatsRow, error) {
+	row := q.db.QueryRow(ctx, serviceCatalogStats, providerID)
+	var i ServiceCatalogStatsRow
+	err := row.Scan(
+		&i.Total,
+		&i.Active,
+		&i.PriceMinCents,
+		&i.PriceMaxCents,
+		&i.PriceAvgCents,
+		&i.DurationMinMinutes,
+		&i.DurationMaxMinutes,
+		&i.DurationAvgMinutes,
+	)
+	return i, err
+}
+
+const serviceCountByCategory = `-- name: ServiceCountByCategory :many
+SELECT s.category_id, c.name AS category_name, count(*)::bigint AS service_count
+FROM services s
+LEFT JOIN categories c ON c.id = s.category_id
+WHERE s.provider_id = $1
+GROUP BY s.category_id, c.name
+ORDER BY count(*) DESC, c.name
+`
+
+type ServiceCountByCategoryRow struct {
+	CategoryID   uuid.UUID
+	CategoryName *string
+	ServiceCount int64
+}
+
+func (q *Queries) ServiceCountByCategory(ctx context.Context, providerID uuid.UUID) ([]ServiceCountByCategoryRow, error) {
+	rows, err := q.db.Query(ctx, serviceCountByCategory, providerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ServiceCountByCategoryRow{}
+	for rows.Next() {
+		var i ServiceCountByCategoryRow
+		if err := rows.Scan(&i.CategoryID, &i.CategoryName, &i.ServiceCount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const servicesAddedByMonth = `-- name: ServicesAddedByMonth :many
+SELECT date_trunc('month', created_at)::date AS month, count(*)::bigint AS added
+FROM services
+WHERE provider_id = $1
+  AND created_at >= date_trunc('month', now()) - make_interval(months => $2::int)
+GROUP BY 1
+ORDER BY 1
+`
+
+type ServicesAddedByMonthParams struct {
+	ProviderID uuid.UUID
+	MonthsBack int32
+}
+
+type ServicesAddedByMonthRow struct {
+	Month time.Time
+	Added int64
+}
+
+// Services added per month over a rolling window, for the catalog-growth area
+// chart. `prior_total` is what existed before the window, so the running total
+// the client draws starts from the truth rather than from zero.
+func (q *Queries) ServicesAddedByMonth(ctx context.Context, arg ServicesAddedByMonthParams) ([]ServicesAddedByMonthRow, error) {
+	rows, err := q.db.Query(ctx, servicesAddedByMonth, arg.ProviderID, arg.MonthsBack)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ServicesAddedByMonthRow{}
+	for rows.Next() {
+		var i ServicesAddedByMonthRow
+		if err := rows.Scan(&i.Month, &i.Added); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const servicesCreatedBefore = `-- name: ServicesCreatedBefore :one
+SELECT count(*)::bigint
+FROM services
+WHERE provider_id = $1
+  AND created_at < date_trunc('month', now()) - make_interval(months => $2::int)
+`
+
+type ServicesCreatedBeforeParams struct {
+	ProviderID uuid.UUID
+	MonthsBack int32
+}
+
+func (q *Queries) ServicesCreatedBefore(ctx context.Context, arg ServicesCreatedBeforeParams) (int64, error) {
+	row := q.db.QueryRow(ctx, servicesCreatedBefore, arg.ProviderID, arg.MonthsBack)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const setServiceImage = `-- name: SetServiceImage :one

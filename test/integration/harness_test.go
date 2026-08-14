@@ -7,6 +7,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,6 +35,7 @@ import (
 	"github.com/nearby/booking-backend/internal/booking"
 	"github.com/nearby/booking-backend/internal/catalog"
 	httpapi "github.com/nearby/booking-backend/internal/http"
+	"github.com/nearby/booking-backend/internal/media"
 	"github.com/nearby/booking-backend/internal/platform/config"
 	"github.com/nearby/booking-backend/internal/platform/database"
 	"github.com/nearby/booking-backend/internal/scheduling"
@@ -131,7 +134,47 @@ func migrate(databaseURL string) error {
 // exercise the same middleware chains that production does.
 type testServer struct {
 	*httptest.Server
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	codes *capturedCodes
+}
+
+// capturedCodes is the test's auth.CodeSender: it keeps what would have been
+// sent, so a test can act on a verification code the way a real recipient
+// would. Guarded by a mutex because sign-ups happen on server goroutines.
+type capturedCodes struct {
+	mu   sync.Mutex
+	sent []sentCode
+}
+
+type sentCode struct {
+	Channel     string
+	Destination string
+	Code        string
+}
+
+func (c *capturedCodes) SendCode(_ context.Context, channel, destination, code string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sent = append(c.sent, sentCode{Channel: channel, Destination: destination, Code: code})
+	return nil
+}
+
+// latestFor returns the most recent code sent to destination, which is the
+// only one still live: issuing a code retires the ones before it.
+func (c *capturedCodes) latestFor(t *testing.T, destination string) string {
+	t.Helper()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for i := len(c.sent) - 1; i >= 0; i-- {
+		if strings.EqualFold(c.sent[i].Destination, destination) {
+			return c.sent[i].Code
+		}
+	}
+
+	t.Fatalf("no verification code was sent to %s", destination)
+	return ""
 }
 
 // newServer truncates the database and returns a fresh API.
@@ -170,7 +213,13 @@ func newServer(t *testing.T) *testServer {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	issuer := auth.NewTokenIssuer(cfg.JWTSecret, cfg.JWTIssuer, cfg.AccessTokenTTL)
-	authService := auth.NewService(testPool, issuer, cfg.RefreshTokenTTLWeb, cfg.RefreshTokenTTLMobile)
+
+	// Stands in for the SMS/email provider, and lets a test read the code that
+	// production would have delivered.
+	codes := &capturedCodes{}
+
+	authService := auth.NewService(testPool, issuer, codes, logger,
+		cfg.RefreshTokenTTLWeb, cfg.RefreshTokenTTLMobile)
 	tenantService := tenant.NewService(testPool, cfg.DefaultTimezone, cfg.MinLeadMinutes)
 	catalogService := catalog.New(testPool)
 	scheduler := scheduling.New(testPool, catalogService, scheduling.Options{
@@ -179,19 +228,26 @@ func newServer(t *testing.T) *testServer {
 	})
 	bookingService := booking.NewService(testPool, catalogService, scheduler)
 
+	// Uploads land in the test's own temp dir, so nothing leaks between runs.
+	localMedia, err := media.NewLocalStorage(t.TempDir(), "/media")
+	require.NoError(t, err)
+	mediaService := media.NewService(testPool, localMedia, logger)
+
 	handler := httpapi.NewRouter(cfg, logger, testPool, httpapi.Services{
-		Auth:      authService,
-		Tenant:    tenantService,
-		Catalog:   catalogService,
-		Scheduler: scheduler,
-		Booking:   bookingService,
-		Issuer:    issuer,
+		Auth:       authService,
+		Tenant:     tenantService,
+		Catalog:    catalogService,
+		Scheduler:  scheduler,
+		Booking:    bookingService,
+		Media:      mediaService,
+		LocalMedia: localMedia,
+		Issuer:     issuer,
 	})
 
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 
-	return &testServer{Server: server, pool: testPool}
+	return &testServer{Server: server, pool: testPool, codes: codes}
 }
 
 // truncateAll empties every table. `migrations` is excluded so goose does not
@@ -244,14 +300,26 @@ func (r response) String() string {
 
 // requestOptions carries the headers that distinguish the four surfaces.
 type requestOptions struct {
-	token string
-	orgID string
+	token   string
+	orgID   string
+	headers map[string]string
 }
 
 type option func(*requestOptions)
 
 func withToken(token string) option { return func(o *requestOptions) { o.token = token } }
 func withOrg(orgID string) option   { return func(o *requestOptions) { o.orgID = orgID } }
+
+// withHeader sets one header, for the requests that are not JSON — multipart
+// uploads carry a generated boundary in their content type.
+func withHeader(name, value string) option {
+	return func(o *requestOptions) {
+		if o.headers == nil {
+			o.headers = map[string]string{}
+		}
+		o.headers[name] = value
+	}
+}
 
 func (s *testServer) do(t *testing.T, method, path string, body any, opts ...option) response {
 	t.Helper()
@@ -279,6 +347,10 @@ func (s *testServer) do(t *testing.T, method, path string, body any, opts ...opt
 	}
 	if options.orgID != "" {
 		req.Header.Set("x-organization-id", options.orgID)
+	}
+
+	for name, value := range options.headers {
+		req.Header.Set(name, value)
 	}
 
 	resp, err := s.Client().Do(req)
@@ -315,6 +387,53 @@ func (s *testServer) patch(t *testing.T, path string, body any, opts ...option) 
 func (s *testServer) delete(t *testing.T, path string, opts ...option) response {
 	t.Helper()
 	return s.do(t, http.MethodDelete, path, nil, opts...)
+}
+
+// doRaw sends a pre-encoded body, for requests that are not JSON.
+func (s *testServer) doRaw(t *testing.T, method, path string, body []byte, opts ...option) response {
+	t.Helper()
+
+	var options requestOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	req, err := http.NewRequest(method, s.URL+path, bytes.NewReader(body))
+	require.NoError(t, err)
+
+	if options.token != "" {
+		req.Header.Set("Authorization", "Bearer "+options.token)
+	}
+	if options.orgID != "" {
+		req.Header.Set("x-organization-id", options.orgID)
+	}
+	for name, value := range options.headers {
+		req.Header.Set(name, value)
+	}
+
+	resp, err := s.Client().Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	out := response{Status: resp.StatusCode, Raw: string(raw)}
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &out.Body)
+	}
+	return out
+}
+
+// getRaw fetches a non-API path (an uploaded image, say) and hands back the
+// response itself, headers included.
+func (s *testServer) getRaw(t *testing.T, path string) *http.Response {
+	t.Helper()
+
+	resp, err := s.Client().Get(s.URL + path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	return resp
 }
 
 // --- assertions -------------------------------------------------------------
@@ -363,13 +482,20 @@ func (s *testServer) signUp(t *testing.T, name, email string) testUser {
 	}
 }
 
-// signIn authenticates an existing account.
+// signIn authenticates an existing account created by this harness.
 func (s *testServer) signIn(t *testing.T, email string) testUser {
+	t.Helper()
+	return s.signInWith(t, email, "password123")
+}
+
+// signInWith authenticates with an explicit password, for accounts whose
+// credentials the harness did not choose.
+func (s *testServer) signInWith(t *testing.T, email, password string) testUser {
 	t.Helper()
 
 	resp := s.post(t, "/api/v1/auth/sign-in", map[string]any{
 		"email":    email,
-		"password": "password123",
+		"password": password,
 	})
 	requireStatus(t, resp, http.StatusOK)
 

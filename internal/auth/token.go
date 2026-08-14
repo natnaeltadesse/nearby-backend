@@ -35,6 +35,27 @@ type Membership struct {
 	Role       string    `json:"role"`
 }
 
+// MembershipDetail is a membership plus enough of the provider to name it in a
+// UI, which a client needs to let someone who owns several businesses choose
+// between them. It is what the API returns; the JWT keeps the smaller
+// Membership, because a claim rides along on every single request and a display
+// name is not worth the bytes.
+type MembershipDetail struct {
+	Membership
+	Name   string `json:"name"`
+	Slug   string `json:"slug"`
+	Status string `json:"status"`
+}
+
+// Claims narrows details down to what the token actually carries.
+func claimsFor(details []MembershipDetail) []Membership {
+	memberships := make([]Membership, 0, len(details))
+	for _, detail := range details {
+		memberships = append(memberships, detail.Membership)
+	}
+	return memberships
+}
+
 // Claims is the access-token payload. It is verified locally on every request,
 // so nothing here may be security-critical beyond the signature itself: the
 // org middleware still re-checks membership against the database.

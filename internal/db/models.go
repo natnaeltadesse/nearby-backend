@@ -197,6 +197,17 @@ type Service struct {
 	UpdatedAt       time.Time
 }
 
+type ServiceMedium struct {
+	ID            uuid.UUID
+	ServiceID     uuid.UUID
+	ProviderID    uuid.UUID
+	ImageUrl      string
+	ImagePublicID string
+	Caption       *string
+	SortOrder     int32
+	CreatedAt     time.Time
+}
+
 type ServiceOption struct {
 	ID                   uuid.UUID
 	GroupID              uuid.UUID
@@ -220,4 +231,16 @@ type User struct {
 	FcmToken      *string
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+}
+
+type VerificationCode struct {
+	ID          uuid.UUID
+	UserID      uuid.UUID
+	Channel     string
+	Destination string
+	CodeHash    string
+	Attempts    int32
+	ExpiresAt   time.Time
+	ConsumedAt  *time.Time
+	CreatedAt   time.Time
 }

@@ -25,6 +25,7 @@ import (
 	"github.com/nearby/booking-backend/internal/http/provider"
 	"github.com/nearby/booking-backend/internal/http/public"
 	"github.com/nearby/booking-backend/internal/http/shared"
+	"github.com/nearby/booking-backend/internal/media"
 	"github.com/nearby/booking-backend/internal/platform/config"
 	"github.com/nearby/booking-backend/internal/platform/httpx"
 	"github.com/nearby/booking-backend/internal/scheduling"
@@ -40,7 +41,11 @@ type Services struct {
 	Catalog   *catalog.Catalog
 	Scheduler *scheduling.Scheduler
 	Booking   *booking.Service
+	Media     *media.Service
 	Issuer    *auth.TokenIssuer
+	// LocalMedia is set only when uploads are kept on this machine. When it is
+	// nil the bytes live with a hosted provider and this API serves none.
+	LocalMedia *media.LocalStorage
 }
 
 // NewRouter builds the complete HTTP handler.
@@ -55,6 +60,13 @@ func NewRouter(cfg config.Config, logger *slog.Logger, pool *pgxpool.Pool, svc S
 
 	r.NotFound(httpx.NotFoundHandler())
 	r.MethodNotAllowed(httpx.MethodNotAllowedHandler())
+
+	// Uploaded images, when they are kept locally. Unauthenticated on purpose:
+	// these are the same pictures the public app shows, and the keys are
+	// unguessable, so a token would buy nothing.
+	if svc.LocalMedia != nil {
+		r.Get("/media/{key}", localMediaHandler(svc.LocalMedia))
+	}
 
 	r.Get("/healthz", healthHandler(pool))
 	r.Get("/readyz", readyHandler(pool))
@@ -102,7 +114,8 @@ func NewRouter(cfg config.Config, logger *slog.Logger, pool *pgxpool.Pool, svc S
 		v1.Group(func(org chi.Router) {
 			org.Use(auth.RequireAuth(svc.Issuer))
 			org.Use(tenant.RequireOrg(svc.Tenant))
-			org.Mount("/org", provider.New(svc.Tenant, svc.Catalog, svc.Scheduler, svc.Booking).Routes())
+			org.Mount("/org", provider.New(
+				svc.Tenant, svc.Catalog, svc.Scheduler, svc.Booking, svc.Media).Routes())
 		})
 
 		// ---------------------------------------------------------------
@@ -119,6 +132,27 @@ func NewRouter(cfg config.Config, logger *slog.Logger, pool *pgxpool.Pool, svc S
 	})
 
 	return r
+}
+
+// localMediaHandler serves an uploaded image off local disk.
+//
+// nosniff is not decoration here: this is user-supplied content served from
+// the API's own origin, and the whole safety argument rests on the browser
+// treating it as the type we say it is rather than guessing.
+func localMediaHandler(storage *media.LocalStorage) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		file, contentType, err := storage.Open(chi.URLParam(r, "key"))
+		if err != nil {
+			httpx.WriteError(w, r, httpx.NotFound("Image"))
+			return
+		}
+		defer func() { _ = file.Close() }()
+
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		http.ServeContent(w, r, "", time.Time{}, file)
+	}
 }
 
 // healthHandler reports that the process is up. Deliberately does not touch

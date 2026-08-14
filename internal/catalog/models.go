@@ -64,11 +64,14 @@ type Attribute struct {
 
 // Service is one bookable thing a provider sells.
 type Service struct {
-	ID          uuid.UUID `json:"id"`
-	ProviderID  uuid.UUID `json:"providerId"`
-	CategoryID  uuid.UUID `json:"categoryId"`
-	Name        string    `json:"name"`
-	Description *string   `json:"description,omitempty"`
+	ID         uuid.UUID `json:"id"`
+	ProviderID uuid.UUID `json:"providerId"`
+	CategoryID uuid.UUID `json:"categoryId"`
+	// CategoryName is populated by the list endpoints, which join it anyway to
+	// sort by it. Saves every client re-deriving the label from a uuid.
+	CategoryName *string `json:"categoryName,omitempty"`
+	Name         string  `json:"name"`
+	Description  *string `json:"description,omitempty"`
 	// Minor units (santim): 24500 = 245.00 ETB. Never a float.
 	PriceCents int32  `json:"priceCents"`
 	Currency   string `json:"currency"`

@@ -22,3 +22,6 @@ coverage.*
 .DS_Store
 Thumbs.db
 *.swp
+
+# Locally-stored uploads (development storage backend).
+uploads/

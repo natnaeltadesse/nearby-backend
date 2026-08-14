@@ -6,6 +6,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/mail"
 	"strings"
 	"time"
@@ -43,9 +44,9 @@ type Tokens struct {
 
 // Session is what sign-up, sign-in and refresh all return.
 type Session struct {
-	User        User         `json:"user"`
-	Memberships []Membership `json:"memberships"`
-	Tokens      Tokens       `json:"tokens"`
+	User        User               `json:"user"`
+	Memberships []MembershipDetail `json:"memberships"`
+	Tokens      Tokens             `json:"tokens"`
 }
 
 // Service implements the auth use cases.
@@ -53,16 +54,35 @@ type Service struct {
 	pool          *pgxpool.Pool
 	queries       *db.Queries
 	issuer        *TokenIssuer
+	sender        CodeSender
+	logger        *slog.Logger
 	refreshTTLWeb time.Duration
 	refreshTTLMob time.Duration
 }
 
-// NewService wires the auth service.
-func NewService(pool *pgxpool.Pool, issuer *TokenIssuer, refreshTTLWeb, refreshTTLMobile time.Duration) *Service {
+// NewService wires the auth service. A nil sender falls back to logging codes
+// rather than delivering them, so a misconfigured deployment is loud in the
+// logs instead of silently issuing codes nobody ever receives.
+func NewService(
+	pool *pgxpool.Pool,
+	issuer *TokenIssuer,
+	sender CodeSender,
+	logger *slog.Logger,
+	refreshTTLWeb, refreshTTLMobile time.Duration,
+) *Service {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if sender == nil {
+		sender = NewLogCodeSender(logger)
+	}
+
 	return &Service{
 		pool:          pool,
 		queries:       db.New(pool),
 		issuer:        issuer,
+		sender:        sender,
+		logger:        logger,
 		refreshTTLWeb: refreshTTLWeb,
 		refreshTTLMob: refreshTTLMobile,
 	}
@@ -81,15 +101,15 @@ type SignUpInput struct {
 // SignUp creates an account and returns a session for it.
 func (s *Service) SignUp(ctx context.Context, in SignUpInput) (*Session, error) {
 	name := strings.TrimSpace(in.Name)
-	email := normalizeEmail(in.Email)
+	email := NormalizeEmail(in.Email)
 
 	if name == "" {
 		return nil, httpx.Validation("Name is required")
 	}
-	if err := validateEmail(email); err != nil {
+	if err := ValidateEmail(email); err != nil {
 		return nil, err
 	}
-	if err := validatePassword(in.Password); err != nil {
+	if err := ValidatePassword(in.Password); err != nil {
 		return nil, err
 	}
 
@@ -123,9 +143,19 @@ func (s *Service) SignUp(ctx context.Context, in SignUpInput) (*Session, error) 
 		UpdatedAt:     row.UpdatedAt,
 	}
 
+	// Issue the address-verification code. A failure here is logged and
+	// swallowed: the account exists either way, and refusing the sign-up over
+	// an undelivered code would leave the caller unable to sign in to an
+	// account they were told was not created. Resend covers the rest.
+	if err := s.IssueEmailVerification(ctx, user.ID, user.Email); err != nil {
+		s.logger.ErrorContext(ctx, "could not issue verification code at sign-up",
+			slog.String("userId", user.ID.String()),
+			slog.String("error", err.Error()))
+	}
+
 	// A brand-new account has no memberships by construction, so there is no
 	// point querying for them.
-	return s.newSession(ctx, user, []Membership{}, NormalizeClientType(in.ClientType))
+	return s.newSession(ctx, user, []MembershipDetail{}, NormalizeClientType(in.ClientType))
 }
 
 // SignInInput is a credential check.
@@ -137,7 +167,7 @@ type SignInInput struct {
 
 // SignIn verifies credentials and returns a session.
 func (s *Service) SignIn(ctx context.Context, in SignInInput) (*Session, error) {
-	email := normalizeEmail(in.Email)
+	email := NormalizeEmail(in.Email)
 	if email == "" || in.Password == "" {
 		return nil, httpx.InvalidCredentials()
 	}
@@ -292,7 +322,7 @@ func (s *Service) SignOutEverywhere(ctx context.Context, userID uuid.UUID) error
 
 // CurrentSession re-reads the user and memberships behind an access token.
 // Used by GET /auth/session so a client can rehydrate without a refresh.
-func (s *Service) CurrentSession(ctx context.Context, userID uuid.UUID) (User, []Membership, error) {
+func (s *Service) CurrentSession(ctx context.Context, userID uuid.UUID) (User, []MembershipDetail, error) {
 	row, err := s.queries.GetUserByID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -371,13 +401,13 @@ func (s *Service) RegisterDevice(ctx context.Context, userID uuid.UUID, fcmToken
 
 // --- internals ------------------------------------------------------------
 
-func (s *Service) newSession(ctx context.Context, user User, memberships []Membership, clientType string) (*Session, error) {
+func (s *Service) newSession(ctx context.Context, user User, memberships []MembershipDetail, clientType string) (*Session, error) {
 	return s.issueSession(ctx, s.queries, user, memberships, clientType)
 }
 
-func (s *Service) issueSession(ctx context.Context, q *db.Queries, user User, memberships []Membership, clientType string) (*Session, error) {
+func (s *Service) issueSession(ctx context.Context, q *db.Queries, user User, memberships []MembershipDetail, clientType string) (*Session, error) {
 	accessToken, expiresAt, err := s.issuer.IssueAccessToken(
-		user.ID, user.Email, user.Name, user.PlatformRole, memberships)
+		user.ID, user.Email, user.Name, user.PlatformRole, claimsFor(memberships))
 	if err != nil {
 		return nil, httpx.Internal(err)
 	}
@@ -415,27 +445,37 @@ func (s *Service) refreshTTL(clientType string) time.Duration {
 	return s.refreshTTLWeb
 }
 
-func (s *Service) membershipsFor(ctx context.Context, userID uuid.UUID) ([]Membership, error) {
+func (s *Service) membershipsFor(ctx context.Context, userID uuid.UUID) ([]MembershipDetail, error) {
 	return membershipsFromQuerier(ctx, s.queries, userID)
 }
 
-func membershipsFromQuerier(ctx context.Context, q *db.Queries, userID uuid.UUID) ([]Membership, error) {
+func membershipsFromQuerier(ctx context.Context, q *db.Queries, userID uuid.UUID) ([]MembershipDetail, error) {
 	rows, err := q.ListMembershipsByUser(ctx, userID)
 	if err != nil {
 		return nil, httpx.Internal(err)
 	}
-	memberships := make([]Membership, 0, len(rows))
+	memberships := make([]MembershipDetail, 0, len(rows))
 	for _, row := range rows {
-		memberships = append(memberships, Membership{ProviderID: row.ProviderID, Role: row.Role})
+		memberships = append(memberships, MembershipDetail{
+			Membership: Membership{ProviderID: row.ProviderID, Role: row.Role},
+			Name:       row.Name,
+			Slug:       row.Slug,
+			Status:     row.Status,
+		})
 	}
 	return memberships, nil
 }
 
-func normalizeEmail(email string) string {
+// NormalizeEmail lowercases and trims an address so it matches the form the
+// unique index stores. Exported because tenant/ provisions accounts too, and
+// two modules disagreeing about what "the same email" means would let a
+// duplicate slip past the pre-check and surface as a raw constraint error.
+func NormalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
-func validateEmail(email string) error {
+// ValidateEmail rejects an address the platform will not accept.
+func ValidateEmail(email string) error {
 	if email == "" {
 		return httpx.Validation("Email is required")
 	}
@@ -445,7 +485,9 @@ func validateEmail(email string) error {
 	return nil
 }
 
-func validatePassword(password string) error {
+// ValidatePassword applies the one password rule the platform has. Every
+// account-creating path must go through it, not just sign-up.
+func ValidatePassword(password string) error {
 	if len(password) < minPasswordLength {
 		return httpx.Validation("Password must be at least 8 characters")
 	}

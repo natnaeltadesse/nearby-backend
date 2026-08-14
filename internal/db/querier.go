@@ -18,12 +18,20 @@ type Querier interface {
 	AddProviderCategory(ctx context.Context, arg AddProviderCategoryParams) error
 	AddResourceService(ctx context.Context, arg AddResourceServiceParams) error
 	BookingCodeExists(ctx context.Context, code string) (bool, error)
+	// Guarded on consumed_at IS NULL so two simultaneous submissions of the same
+	// code cannot both succeed; the loser sees zero rows and is treated as stale.
+	ConsumeVerificationCode(ctx context.Context, id uuid.UUID) (int64, error)
+	// Issuing a new code retires every earlier one for that address, so a resend
+	// cannot leave two codes working at once.
+	ConsumeVerificationCodesFor(ctx context.Context, arg ConsumeVerificationCodesForParams) error
 	CountAllBookings(ctx context.Context, arg CountAllBookingsParams) (int64, error)
 	CountBookingsByCustomer(ctx context.Context, arg CountBookingsByCustomerParams) (int64, error)
 	CountBookingsByProvider(ctx context.Context, arg CountBookingsByProviderParams) (int64, error)
 	// Guards against removing or demoting the last owner of a provider.
 	CountOwners(ctx context.Context, providerID uuid.UUID) (int64, error)
 	CountProviders(ctx context.Context, arg CountProvidersParams) (int64, error)
+	CountServiceMedia(ctx context.Context, serviceID uuid.UUID) (int64, error)
+	CountServicesPage(ctx context.Context, arg CountServicesPageParams) (int64, error)
 	CountUsers(ctx context.Context, search string) (int64, error)
 	// May fail with 23P01 (bookings_no_overlap). The store maps that to SLOT_TAKEN.
 	CreateBooking(ctx context.Context, arg CreateBookingParams) (Booking, error)
@@ -45,24 +53,29 @@ type Querier interface {
 	// ---------------------------------------------------------------- exceptions
 	CreateScheduleException(ctx context.Context, arg CreateScheduleExceptionParams) (ScheduleException, error)
 	CreateService(ctx context.Context, arg CreateServiceParams) (Service, error)
+	CreateServiceMedia(ctx context.Context, arg CreateServiceMediaParams) (ServiceMedium, error)
 	// ---------------------------------------------------------------- options
 	CreateServiceOption(ctx context.Context, arg CreateServiceOptionParams) (ServiceOption, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (CreateUserRow, error)
+	CreateVerificationCode(ctx context.Context, arg CreateVerificationCodeParams) (CreateVerificationCodeRow, error)
 	DeleteBusinessHours(ctx context.Context, arg DeleteBusinessHoursParams) (int64, error)
 	DeleteCategory(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteCategoryAttribute(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteExpiredRefreshTokens(ctx context.Context) (int64, error)
+	DeleteExpiredVerificationCodes(ctx context.Context) (int64, error)
 	DeleteInvitation(ctx context.Context, arg DeleteInvitationParams) (int64, error)
 	DeleteOptionGroup(ctx context.Context, arg DeleteOptionGroupParams) (int64, error)
 	DeleteResource(ctx context.Context, arg DeleteResourceParams) (int64, error)
 	DeleteScheduleException(ctx context.Context, arg DeleteScheduleExceptionParams) (int64, error)
 	DeleteService(ctx context.Context, arg DeleteServiceParams) (int64, error)
+	DeleteServiceMedia(ctx context.Context, arg DeleteServiceMediaParams) (string, error)
 	DeleteServiceOption(ctx context.Context, arg DeleteServiceOptionParams) (int64, error)
 	GetBooking(ctx context.Context, id uuid.UUID) (Booking, error)
 	GetCategoryAttribute(ctx context.Context, id uuid.UUID) (CategoryAttribute, error)
 	GetCategoryByID(ctx context.Context, id uuid.UUID) (Category, error)
 	GetCategoryBySlug(ctx context.Context, slug string) (Category, error)
 	GetInvitationByTokenHash(ctx context.Context, tokenHash string) (Invitation, error)
+	GetLiveVerificationCode(ctx context.Context, arg GetLiveVerificationCodeParams) (VerificationCode, error)
 	// The membership check behind every /org/* request. `x-organization-id` is
 	// client-supplied, so this runs before any org-scoped data is read.
 	GetMembership(ctx context.Context, arg GetMembershipParams) (Member, error)
@@ -72,11 +85,15 @@ type Querier interface {
 	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (RefreshToken, error)
 	GetResource(ctx context.Context, id uuid.UUID) (Resource, error)
 	GetService(ctx context.Context, id uuid.UUID) (Service, error)
+	// Scoped on provider_id as well as id: a leaked media id from another tenant
+	// still finds nothing.
+	GetServiceMedia(ctx context.Context, arg GetServiceMediaParams) (ServiceMedium, error)
 	// Everything booking needs about a service in one round trip: the provider's
 	// booking_mode, timezone and status decide the rest of the flow.
 	GetServiceWithProvider(ctx context.Context, id uuid.UUID) (GetServiceWithProviderRow, error)
 	GetUserByEmail(ctx context.Context, email string) (User, error)
 	GetUserByID(ctx context.Context, id uuid.UUID) (GetUserByIDRow, error)
+	IncrementVerificationAttempts(ctx context.Context, id uuid.UUID) (int32, error)
 	// Platform-admin cross-tenant listing. Deliberately separate from the
 	// provider inbox query: it is not org-scoped, so it must never share a code
 	// path with one that is.
@@ -117,8 +134,21 @@ type Querier interface {
 	// Availability step 3: an exception for this date overrides business_hours.
 	ListScheduleExceptionsForDate(ctx context.Context, arg ListScheduleExceptionsForDateParams) ([]ListScheduleExceptionsForDateRow, error)
 	ListServiceIDsForResource(ctx context.Context, resourceID uuid.UUID) ([]uuid.UUID, error)
+	ListServiceMedia(ctx context.Context, serviceID uuid.UUID) ([]ServiceMedium, error)
 	ListServicesByProvider(ctx context.Context, arg ListServicesByProviderParams) ([]Service, error)
+	// The org catalog list: search, filter, sort and paginate, all in the
+	// database. sqlc cannot interpolate an ORDER BY, so the sort key arrives as a
+	// whitelisted string and is resolved by CASE — which keeps it a bound
+	// parameter rather than concatenated SQL.
+	//
+	// The join is what lets `category` be a sortable column: sorting on
+	// category_id would order by a uuid, which is nothing a reader recognises.
+	ListServicesPage(ctx context.Context, arg ListServicesPageParams) ([]ListServicesPageRow, error)
 	ListUsers(ctx context.Context, arg ListUsersParams) ([]ListUsersRow, error)
+	MarkEmailVerified(ctx context.Context, id uuid.UUID) error
+	// New images land after the ones already there, so upload order is preserved
+	// without the client having to say so.
+	NextServiceMediaSortOrder(ctx context.Context, serviceID uuid.UUID) (int32, error)
 	ProviderBookingStats(ctx context.Context, arg ProviderBookingStatsParams) (ProviderBookingStatsRow, error)
 	RemoveMember(ctx context.Context, arg RemoveMemberParams) (int64, error)
 	RemoveProviderCategory(ctx context.Context, arg RemoveProviderCategoryParams) (int64, error)
@@ -131,6 +161,17 @@ type Querier interface {
 	// the read, but only one of them can move revoked_at from NULL.
 	RevokeRefreshToken(ctx context.Context, id uuid.UUID) (int64, error)
 	RevokeRefreshTokenByHash(ctx context.Context, tokenHash string) (RevokeRefreshTokenByHashRow, error)
+	// Catalog-wide figures for the provider dashboard's stat cards. Deliberately
+	// unfiltered: these describe the whole catalog, while the table beneath them
+	// describes the current query.
+	ServiceCatalogStats(ctx context.Context, providerID uuid.UUID) (ServiceCatalogStatsRow, error)
+	ServiceCountByCategory(ctx context.Context, providerID uuid.UUID) ([]ServiceCountByCategoryRow, error)
+	ServiceExistsForProvider(ctx context.Context, arg ServiceExistsForProviderParams) (bool, error)
+	// Services added per month over a rolling window, for the catalog-growth area
+	// chart. `prior_total` is what existed before the window, so the running total
+	// the client draws starts from the truth rather than from zero.
+	ServicesAddedByMonth(ctx context.Context, arg ServicesAddedByMonthParams) ([]ServicesAddedByMonthRow, error)
+	ServicesCreatedBefore(ctx context.Context, arg ServicesCreatedBeforeParams) (int64, error)
 	SetProviderStatus(ctx context.Context, arg SetProviderStatusParams) (SetProviderStatusRow, error)
 	SetServiceImage(ctx context.Context, arg SetServiceImageParams) (SetServiceImageRow, error)
 	SetUserFCMToken(ctx context.Context, arg SetUserFCMTokenParams) error
@@ -147,6 +188,7 @@ type Querier interface {
 	UpdateResource(ctx context.Context, arg UpdateResourceParams) (Resource, error)
 	UpdateScheduleException(ctx context.Context, arg UpdateScheduleExceptionParams) (ScheduleException, error)
 	UpdateService(ctx context.Context, arg UpdateServiceParams) (Service, error)
+	UpdateServiceMedia(ctx context.Context, arg UpdateServiceMediaParams) (ServiceMedium, error)
 	UpdateServiceOption(ctx context.Context, arg UpdateServiceOptionParams) (ServiceOption, error)
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (UpdateUserProfileRow, error)
 }

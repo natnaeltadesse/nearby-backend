@@ -273,3 +273,121 @@ func TestIntegrationUnknownRouteUsesTheErrorEnvelope(t *testing.T) {
 	resp := s.get(t, "/api/v1/nope")
 	requireError(t, resp, http.StatusNotFound, "NOT_FOUND")
 }
+
+// Sign-up issues a one-time code for the address it was given. Until an SMS or
+// email provider is configured the code goes to the log; the test harness
+// captures it the same way a recipient would read it.
+func TestIntegrationEmailVerification(t *testing.T) {
+	s := newServer(t)
+
+	resp := s.post(t, "/api/v1/auth/sign-up", map[string]any{
+		"name":     "Abebe Kebede",
+		"email":    "abebe@example.et",
+		"password": "password123",
+	})
+	requireStatus(t, resp, http.StatusCreated)
+
+	user := resp.Body["user"].(map[string]any)
+	assert.Equal(t, false, user["emailVerified"], "an address starts unproven")
+
+	code := s.codes.latestFor(t, "abebe@example.et")
+	require.Len(t, code, 6, "a six-digit code is what the client prompts for")
+	assert.NotContains(t, resp.Raw, code, "the code must never ride back in the response")
+
+	t.Run("a wrong code is refused", func(t *testing.T) {
+		wrong := "000000"
+		if wrong == code {
+			wrong = "111111"
+		}
+		requireError(t, s.post(t, "/api/v1/auth/verify-email", map[string]any{
+			"email": "abebe@example.et", "code": wrong,
+		}), http.StatusBadRequest, "INVALID_CODE")
+	})
+
+	t.Run("an unknown address is refused the same way", func(t *testing.T) {
+		requireError(t, s.post(t, "/api/v1/auth/verify-email", map[string]any{
+			"email": "nobody@example.et", "code": code,
+		}), http.StatusBadRequest, "INVALID_CODE")
+	})
+
+	t.Run("the right code verifies the address", func(t *testing.T) {
+		verify := s.post(t, "/api/v1/auth/verify-email", map[string]any{
+			"email": "ABEBE@EXAMPLE.ET", // normalized like everywhere else
+			"code":  code,
+		})
+		requireStatus(t, verify, http.StatusOK)
+
+		session := s.get(t, "/api/v1/auth/session", withToken(s.signIn(t, "abebe@example.et").AccessToken))
+		requireStatus(t, session, http.StatusOK)
+		assert.Equal(t, true, session.Body["user"].(map[string]any)["emailVerified"])
+	})
+
+	t.Run("a code cannot be replayed", func(t *testing.T) {
+		requireError(t, s.post(t, "/api/v1/auth/verify-email", map[string]any{
+			"email": "abebe@example.et", "code": code,
+		}), http.StatusBadRequest, "INVALID_CODE")
+	})
+}
+
+// Resending retires the previous code, so exactly one is ever live.
+func TestIntegrationResendVerificationRetiresTheOldCode(t *testing.T) {
+	s := newServer(t)
+
+	s.signUp(t, "Selam", "selam@example.et")
+	first := s.codes.latestFor(t, "selam@example.et")
+
+	resend := s.post(t, "/api/v1/auth/resend-verification",
+		map[string]any{"email": "selam@example.et"})
+	requireStatus(t, resend, http.StatusNoContent)
+
+	second := s.codes.latestFor(t, "selam@example.et")
+	require.NotEqual(t, first, second, "a resend issues a new code")
+
+	requireError(t, s.post(t, "/api/v1/auth/verify-email", map[string]any{
+		"email": "selam@example.et", "code": first,
+	}), http.StatusBadRequest, "INVALID_CODE")
+
+	requireStatus(t, s.post(t, "/api/v1/auth/verify-email", map[string]any{
+		"email": "selam@example.et", "code": second,
+	}), http.StatusOK)
+}
+
+// An address with no account must not be distinguishable from one that has.
+func TestIntegrationResendDoesNotRevealRegistrations(t *testing.T) {
+	s := newServer(t)
+
+	requireStatus(t, s.post(t, "/api/v1/auth/resend-verification",
+		map[string]any{"email": "nobody@example.et"}), http.StatusNoContent)
+
+	requireError(t, s.post(t, "/api/v1/auth/resend-verification",
+		map[string]any{"email": "not-an-email"}), http.StatusUnprocessableEntity, "VALIDATION_ERROR")
+}
+
+// Guessing is capped, and hitting the cap burns the code rather than leaving
+// it to be ground down.
+func TestIntegrationVerificationAttemptsAreCapped(t *testing.T) {
+	s := newServer(t)
+
+	s.signUp(t, "Yonas", "yonas@example.et")
+	code := s.codes.latestFor(t, "yonas@example.et")
+
+	wrong := "000000"
+	if wrong == code {
+		wrong = "111111"
+	}
+
+	for range 5 {
+		requireError(t, s.post(t, "/api/v1/auth/verify-email", map[string]any{
+			"email": "yonas@example.et", "code": wrong,
+		}), http.StatusBadRequest, "INVALID_CODE")
+	}
+
+	requireError(t, s.post(t, "/api/v1/auth/verify-email", map[string]any{
+		"email": "yonas@example.et", "code": wrong,
+	}), http.StatusTooManyRequests, "TOO_MANY_ATTEMPTS")
+
+	// Even the correct code is dead now; a resend is the only way forward.
+	requireError(t, s.post(t, "/api/v1/auth/verify-email", map[string]any{
+		"email": "yonas@example.et", "code": code,
+	}), http.StatusBadRequest, "INVALID_CODE")
+}

@@ -8,6 +8,7 @@
 package provider
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/nearby/booking-backend/internal/booking"
 	"github.com/nearby/booking-backend/internal/catalog"
+	"github.com/nearby/booking-backend/internal/media"
 	"github.com/nearby/booking-backend/internal/platform/httpx"
 	"github.com/nearby/booking-backend/internal/scheduling"
 	"github.com/nearby/booking-backend/internal/tenant"
@@ -28,6 +30,7 @@ type Handler struct {
 	catalog   *catalog.Catalog
 	scheduler *scheduling.Scheduler
 	booking   *booking.Service
+	media     *media.Service
 }
 
 // New builds the org handler.
@@ -36,8 +39,15 @@ func New(
 	cat *catalog.Catalog,
 	scheduler *scheduling.Scheduler,
 	bookingService *booking.Service,
+	mediaService *media.Service,
 ) *Handler {
-	return &Handler{tenant: tenantService, catalog: cat, scheduler: scheduler, booking: bookingService}
+	return &Handler{
+		tenant:    tenantService,
+		catalog:   cat,
+		scheduler: scheduler,
+		booking:   bookingService,
+		media:     mediaService,
+	}
 }
 
 // Routes returns the /org subtree.
@@ -60,6 +70,15 @@ func (h *Handler) Routes() chi.Router {
 		r.Get("/{serviceID}", httpx.H(h.getService))
 		r.With(manage).Patch("/{serviceID}", httpx.H(h.updateService))
 		r.With(manage).Delete("/{serviceID}", httpx.H(h.deleteService))
+
+		// Staff can see the gallery; changing it needs manager or owner, the
+		// same gate as the rest of the catalog.
+		r.Route("/{serviceID}/media", func(r chi.Router) {
+			r.Get("/", httpx.H(h.listServiceMedia))
+			r.With(manage).Post("/", httpx.H(h.uploadServiceMedia))
+			r.With(manage).Patch("/{mediaID}", httpx.H(h.updateServiceMedia))
+			r.With(manage).Delete("/{mediaID}", httpx.H(h.deleteServiceMedia))
+		})
 
 		r.Route("/{serviceID}/option-groups", func(r chi.Router) {
 			r.Get("/", httpx.H(h.listOptionGroups))
@@ -109,6 +128,7 @@ func (h *Handler) Routes() chi.Router {
 
 	r.Route("/members", func(r chi.Router) {
 		r.Get("/", httpx.H(h.listMembers))
+		r.With(own).Post("/", httpx.H(h.createMember))
 		r.With(own).Patch("/{userID}", httpx.H(h.updateMemberRole))
 		r.With(own).Delete("/{userID}", httpx.H(h.removeMember))
 	})
@@ -119,7 +139,10 @@ func (h *Handler) Routes() chi.Router {
 		r.With(manage).Delete("/{invitationID}", httpx.H(h.revokeInvitation))
 	})
 
-	r.Get("/stats/summary", httpx.H(h.stats))
+	r.Route("/stats", func(r chi.Router) {
+		r.Get("/summary", httpx.H(h.stats))
+		r.Get("/catalog", httpx.H(h.catalogStats))
+	})
 
 	return r
 }
@@ -172,13 +195,59 @@ func (h *Handler) listServices(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	// Staff see inactive services too; the public surface does not.
-	services, err := h.catalog.ListServices(r.Context(), org.ProviderID, false)
+	page, err := httpx.ParsePage(r, 25)
 	if err != nil {
 		return err
 	}
 
-	httpx.JSON(w, r, http.StatusOK, map[string]any{"services": services})
+	query := r.URL.Query()
+
+	// `sort` is one key with an optional `-` for descending, matching the
+	// convention the web client already puts in its URL.
+	sortBy, sortDesc := strings.TrimSpace(query.Get("sort")), false
+	if strings.HasPrefix(sortBy, "-") {
+		sortBy, sortDesc = sortBy[1:], true
+	}
+
+	in := catalog.ListServicesInput{
+		Search:   strings.TrimSpace(query.Get("search")),
+		SortBy:   sortBy,
+		SortDesc: sortDesc,
+		Limit:    page.Limit,
+		Offset:   page.Offset,
+	}
+
+	// Absent means "either". Staff see inactive services here; the public
+	// surface never does.
+	switch strings.TrimSpace(query.Get("isActive")) {
+	case "":
+	case "true":
+		active := true
+		in.IsActive = &active
+	case "false":
+		inactive := false
+		in.IsActive = &inactive
+	default:
+		return httpx.Validation("isActive must be 'true' or 'false'")
+	}
+
+	if categoryID, ok, err := httpx.QueryUUID(r, "categoryId"); err != nil {
+		return err
+	} else if ok {
+		in.CategoryID = &categoryID
+	}
+
+	services, total, err := h.catalog.ListServicesPage(r.Context(), org.ProviderID, in)
+	if err != nil {
+		return err
+	}
+
+	httpx.JSON(w, r, http.StatusOK, map[string]any{
+		"services": services,
+		"total":    total,
+		"limit":    page.Limit,
+		"offset":   page.Offset,
+	})
 	return nil
 }
 
@@ -805,6 +874,36 @@ func (h *Handler) listMembers(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+// createMember provisions a login for new staff and returns it as a member.
+//
+// When the owner did not choose a password the server generated one, and the
+// response is the only place it will ever appear — it is hashed on the way in
+// and cannot be read back, so the client has to show it before navigating away.
+func (h *Handler) createMember(w http.ResponseWriter, r *http.Request) error {
+	org, err := tenant.MustOrg(r.Context())
+	if err != nil {
+		return err
+	}
+
+	var in tenant.CreateMemberInput
+	if err := httpx.Decode(r, &in); err != nil {
+		return err
+	}
+
+	member, generatedPassword, err := h.tenant.CreateMember(r.Context(), org.ProviderID, in)
+	if err != nil {
+		return err
+	}
+
+	body := map[string]any{"member": member}
+	if generatedPassword != "" {
+		body["generatedPassword"] = generatedPassword
+	}
+
+	httpx.JSON(w, r, http.StatusCreated, body)
+	return nil
+}
+
 type updateMemberRequest struct {
 	Role string `json:"role"`
 }
@@ -892,6 +991,118 @@ func (h *Handler) revokeInvitation(w http.ResponseWriter, r *http.Request) error
 	}
 
 	if err := h.tenant.RevokeInvitation(r.Context(), org.ProviderID, invitationID); err != nil {
+		return err
+	}
+
+	httpx.NoContent(w)
+	return nil
+}
+
+// catalogStats backs the cards above the services table.
+func (h *Handler) catalogStats(w http.ResponseWriter, r *http.Request) error {
+	org, err := tenant.MustOrg(r.Context())
+	if err != nil {
+		return err
+	}
+
+	stats, err := h.catalog.CatalogStats(r.Context(), org.ProviderID)
+	if err != nil {
+		return err
+	}
+
+	httpx.JSON(w, r, http.StatusOK, stats)
+	return nil
+}
+
+// --- gallery --------------------------------------------------------------
+
+func (h *Handler) listServiceMedia(w http.ResponseWriter, r *http.Request) error {
+	org, serviceID, err := h.orgAndParam(r, "serviceID")
+	if err != nil {
+		return err
+	}
+
+	images, err := h.media.List(r.Context(), org.ProviderID, serviceID)
+	if err != nil {
+		return err
+	}
+
+	httpx.JSON(w, r, http.StatusOK, map[string]any{"images": images})
+	return nil
+}
+
+// uploadServiceMedia takes one image as multipart/form-data.
+//
+// The request body is capped before parsing, not after: MaxBytesReader makes an
+// oversized upload fail at the socket rather than after the server has already
+// buffered it.
+func (h *Handler) uploadServiceMedia(w http.ResponseWriter, r *http.Request) error {
+	org, serviceID, err := h.orgAndParam(r, "serviceID")
+	if err != nil {
+		return err
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, media.MaxImageBytes+1024)
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		// MaxBytesReader cuts the body off mid-parse, so FormFile reports a
+		// malformed form rather than the real reason. Name it properly.
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return httpx.Validation("That image is larger than 5 MB")
+		}
+		return httpx.Validation("Attach the image as a `file` field")
+	}
+	defer func() { _ = file.Close() }()
+
+	data, err := media.ReadLimited(file)
+	if err != nil {
+		return httpx.Validation("That image is larger than 5 MB")
+	}
+
+	var caption *string
+	if value := strings.TrimSpace(r.FormValue("caption")); value != "" {
+		caption = &value
+	}
+
+	image, err := h.media.Upload(
+		r.Context(), org.ProviderID, serviceID, header.Filename, data, caption)
+	if err != nil {
+		return err
+	}
+
+	httpx.JSON(w, r, http.StatusCreated, image)
+	return nil
+}
+
+func (h *Handler) updateServiceMedia(w http.ResponseWriter, r *http.Request) error {
+	org, ids, err := h.orgAndParams(r, "serviceID", "mediaID")
+	if err != nil {
+		return err
+	}
+
+	var in media.UpdateInput
+	if err := httpx.Decode(r, &in); err != nil {
+		return err
+	}
+
+	image, err := h.media.Update(r.Context(), org.ProviderID, ids[1], in)
+	if err != nil {
+		return err
+	}
+
+	httpx.JSON(w, r, http.StatusOK, image)
+	return nil
+}
+
+func (h *Handler) deleteServiceMedia(w http.ResponseWriter, r *http.Request) error {
+	org, ids, err := h.orgAndParams(r, "serviceID", "mediaID")
+	if err != nil {
+		return err
+	}
+
+	if err := h.media.Delete(r.Context(), org.ProviderID, ids[1]); err != nil {
 		return err
 	}
 

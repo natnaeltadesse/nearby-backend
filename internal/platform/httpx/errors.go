@@ -27,6 +27,8 @@ const (
 	CodeServiceInactive    = "SERVICE_INACTIVE"
 	CodeProviderInactive   = "PROVIDER_INACTIVE"
 	CodeConflict           = "CONFLICT"
+	CodeInvalidCode        = "INVALID_CODE"
+	CodeTooManyAttempts    = "TOO_MANY_ATTEMPTS"
 	CodeInternal           = "INTERNAL_ERROR"
 )
 
@@ -152,6 +154,20 @@ func ProviderInactive() *Error {
 // Conflict reports a request that collides with existing state.
 func Conflict(message string) *Error {
 	return newError(http.StatusConflict, CodeConflict, message)
+}
+
+// InvalidCode rejects a one-time verification code. It deliberately covers
+// wrong, expired, already-used and never-issued alike: distinguishing them
+// would turn the endpoint into a way to test which addresses are registered.
+func InvalidCode() *Error {
+	return newError(http.StatusBadRequest, CodeInvalidCode,
+		"That code is not valid. Request a new one.")
+}
+
+// TooManyAttempts reports a one-time code guessed at too often.
+func TooManyAttempts() *Error {
+	return newError(http.StatusTooManyRequests, CodeTooManyAttempts,
+		"Too many incorrect codes. Request a new one.")
 }
 
 // Internal wraps an unexpected failure. The cause is logged, never sent.

@@ -32,6 +32,12 @@ func (h *Handler) Routes() chi.Router {
 	r.Post("/refresh", httpx.H(h.refresh))
 	r.Post("/sign-out", httpx.H(h.signOut))
 
+	// Address verification is deliberately unauthenticated: the code itself is
+	// the proof, and requiring a token as well would block a client that has
+	// not stored one yet.
+	r.Post("/verify-email", httpx.H(h.verifyEmail))
+	r.Post("/resend-verification", httpx.H(h.resendVerification))
+
 	// The only authenticated route here: everything else is how you get a token.
 	r.With(auth.RequireAuth(h.issuer)).Get("/session", httpx.H(h.session))
 	r.With(auth.RequireAuth(h.issuer)).Post("/sign-out-everywhere", httpx.H(h.signOutEverywhere))
@@ -54,6 +60,45 @@ func (h *Handler) signUp(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	httpx.JSON(w, r, http.StatusCreated, session)
+	return nil
+}
+
+type verifyEmailRequest struct {
+	Email string `json:"email"`
+	Code  string `json:"code"`
+}
+
+func (h *Handler) verifyEmail(w http.ResponseWriter, r *http.Request) error {
+	var in verifyEmailRequest
+	if err := httpx.Decode(r, &in); err != nil {
+		return err
+	}
+
+	if err := h.auth.VerifyEmail(r.Context(), in.Email, in.Code); err != nil {
+		return err
+	}
+
+	httpx.JSON(w, r, http.StatusOK, map[string]any{"verified": true})
+	return nil
+}
+
+type resendVerificationRequest struct {
+	Email string `json:"email"`
+}
+
+// resendVerification always reports success for a well-formed address, whether
+// or not it has an account, so it cannot be used to enumerate registrations.
+func (h *Handler) resendVerification(w http.ResponseWriter, r *http.Request) error {
+	var in resendVerificationRequest
+	if err := httpx.Decode(r, &in); err != nil {
+		return err
+	}
+
+	if err := h.auth.ResendEmailVerification(r.Context(), in.Email); err != nil {
+		return err
+	}
+
+	httpx.NoContent(w)
 	return nil
 }
 
@@ -123,8 +168,8 @@ func (h *Handler) signOutEverywhere(w http.ResponseWriter, r *http.Request) erro
 
 // sessionResponse lets a client rehydrate without spending a refresh token.
 type sessionResponse struct {
-	User        auth.User         `json:"user"`
-	Memberships []auth.Membership `json:"memberships"`
+	User        auth.User               `json:"user"`
+	Memberships []auth.MembershipDetail `json:"memberships"`
 }
 
 func (h *Handler) session(w http.ResponseWriter, r *http.Request) error {
