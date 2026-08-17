@@ -21,7 +21,8 @@ RETURNING
     (location IS NOT NULL)::bool AS has_location,
     COALESCE(ST_X(location::geometry), 0)::float8 AS lng,
     COALESCE(ST_Y(location::geometry), 0)::float8 AS lat,
-    timezone, logo_url, logo_public_id, license_number, status,
+    timezone, logo_url, logo_public_id, cover_url, cover_public_id,
+    license_number, status,
     rating_avg::float8 AS rating_avg, rating_count, booking_mode,
     min_lead_minutes, created_at, updated_at;
 
@@ -31,7 +32,8 @@ SELECT
     (location IS NOT NULL)::bool AS has_location,
     COALESCE(ST_X(location::geometry), 0)::float8 AS lng,
     COALESCE(ST_Y(location::geometry), 0)::float8 AS lat,
-    timezone, logo_url, logo_public_id, license_number, status,
+    timezone, logo_url, logo_public_id, cover_url, cover_public_id,
+    license_number, status,
     rating_avg::float8 AS rating_avg, rating_count, booking_mode,
     min_lead_minutes, created_at, updated_at
 FROM providers
@@ -43,7 +45,8 @@ SELECT
     (location IS NOT NULL)::bool AS has_location,
     COALESCE(ST_X(location::geometry), 0)::float8 AS lng,
     COALESCE(ST_Y(location::geometry), 0)::float8 AS lat,
-    timezone, logo_url, logo_public_id, license_number, status,
+    timezone, logo_url, logo_public_id, cover_url, cover_public_id,
+    license_number, status,
     rating_avg::float8 AS rating_avg, rating_count, booking_mode,
     min_lead_minutes, created_at, updated_at
 FROM providers
@@ -73,7 +76,8 @@ RETURNING
     (location IS NOT NULL)::bool AS has_location,
     COALESCE(ST_X(location::geometry), 0)::float8 AS lng,
     COALESCE(ST_Y(location::geometry), 0)::float8 AS lat,
-    timezone, logo_url, logo_public_id, license_number, status,
+    timezone, logo_url, logo_public_id, cover_url, cover_public_id,
+    license_number, status,
     rating_avg::float8 AS rating_avg, rating_count, booking_mode,
     min_lead_minutes, created_at, updated_at;
 
@@ -107,3 +111,21 @@ WHERE (@status::text = '' OR status = @status)
 
 -- name: SlugExists :one
 SELECT EXISTS (SELECT 1 FROM providers WHERE slug = @slug);
+
+-- Branding is written by its own statements rather than through UpdateProvider,
+-- which COALESCEs every column and therefore cannot express "remove this".
+-- Here a null pair is a deliberate clear, so one query covers set and remove.
+
+-- name: SetProviderLogo :execrows
+UPDATE providers
+SET logo_url       = sqlc.narg(logo_url),
+    logo_public_id = sqlc.narg(logo_public_id),
+    updated_at     = now()
+WHERE id = @id;
+
+-- name: SetProviderCover :execrows
+UPDATE providers
+SET cover_url       = sqlc.narg(cover_url),
+    cover_public_id = sqlc.narg(cover_public_id),
+    updated_at      = now()
+WHERE id = @id;

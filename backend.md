@@ -459,11 +459,12 @@ POST   /devices              # register FCM token
 ### `/api/v1/org` (all require `x-organization-id`)
 ```
 GET/PATCH  /profile                     # provider profile, hours, location
+PUT/DELETE /profile/images/:kind        # kind = logo | cover
 CRUD       /services                    # + attribute validation
 CRUD       /services/:id/option-groups  # + /options
 CRUD       /resources
-CRUD       /business-hours
-CRUD       /schedule-exceptions
+CRUD       /business-hours              # + PUT / to replace a whole week
+CRUD       /schedule-exceptions         # holidays and one-off days off
 GET        /bookings?date=&status=&resourceId=
 POST       /bookings/:id/confirm | /start | /complete | /no-show | /cancel
 POST       /bookings                    # walk-in entered by staff

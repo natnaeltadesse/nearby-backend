@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/nearby/booking-backend/internal/db"
+	"github.com/nearby/booking-backend/internal/platform/database"
 	"github.com/nearby/booking-backend/internal/platform/httpx"
 )
 
@@ -284,20 +286,26 @@ func (s *Scheduler) ListResources(ctx context.Context, providerID uuid.UUID, act
 }
 
 // UpdateResourceInput patches a resource.
+//
+// UnassignUser exists because every other field here means "leave it alone"
+// when omitted, which leaves no way to say "belongs to nobody now". Setting it
+// detaches the staff login and overrides UserID.
 type UpdateResourceInput struct {
-	Name     *string    `json:"name"`
-	UserID   *uuid.UUID `json:"userId"`
-	IsActive *bool      `json:"isActive"`
+	Name         *string    `json:"name"`
+	UserID       *uuid.UUID `json:"userId"`
+	UnassignUser bool       `json:"unassignUser"`
+	IsActive     *bool      `json:"isActive"`
 }
 
 // UpdateResource applies a partial update.
 func (s *Scheduler) UpdateResource(ctx context.Context, providerID, id uuid.UUID, in UpdateResourceInput) (*Resource, error) {
 	row, err := s.queries.UpdateResource(ctx, db.UpdateResourceParams{
-		ID:         id,
-		ProviderID: providerID,
-		Name:       trimPtr(in.Name),
-		UserID:     in.UserID,
-		IsActive:   in.IsActive,
+		ID:           id,
+		ProviderID:   providerID,
+		Name:         trimPtr(in.Name),
+		UserID:       in.UserID,
+		UnassignUser: in.UnassignUser,
+		IsActive:     in.IsActive,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -428,6 +436,107 @@ func (s *Scheduler) ListHours(ctx context.Context, providerID uuid.UUID) ([]Hour
 		})
 	}
 	return hours, nil
+}
+
+// ReplaceHoursInput rewrites one scope's whole weekly pattern.
+//
+// A null ResourceID targets the provider-wide default; a set one targets that
+// resource's override. The other scopes are left untouched either way, so
+// saving the shop's week does not silently wipe a barber's own hours.
+type ReplaceHoursInput struct {
+	ResourceID *uuid.UUID   `json:"resourceId"`
+	Hours      []HoursInput `json:"hours"`
+}
+
+// ReplaceHours swaps a scope's weekly pattern for the one supplied.
+//
+// An hours editor saves a week, not a row, and doing that as a stream of
+// creates and deletes would leave the schedule visibly wrong in between — a
+// customer refreshing mid-save could find the shop closed all week. The delete
+// and the inserts therefore share one transaction: either the new week is in
+// place or the old one still is.
+func (s *Scheduler) ReplaceHours(ctx context.Context, providerID uuid.UUID, in ReplaceHoursInput) ([]HoursRule, error) {
+	for _, span := range in.Hours {
+		if span.Weekday < 0 || span.Weekday > 6 {
+			return nil, httpx.Validation("weekday must be between 0 (Sunday) and 6")
+		}
+		if !span.Opens.Valid() || !span.Closes.Valid() {
+			return nil, httpx.Validation("opensAt and closesAt must be times of day")
+		}
+		if span.Closes <= span.Opens {
+			return nil, httpx.Validation("closesAt must be after opensAt")
+		}
+	}
+
+	// Two spans on one day that overlap would generate the same slot twice.
+	// The database has no constraint for this — it is a rule about a set of
+	// rows, not about one — so it is enforced here.
+	if err := assertNoOverlap(in.Hours); err != nil {
+		return nil, err
+	}
+
+	if in.ResourceID != nil {
+		if err := s.assertResourceOwned(ctx, providerID, *in.ResourceID); err != nil {
+			return nil, err
+		}
+	}
+
+	rules := make([]HoursRule, 0, len(in.Hours))
+
+	err := database.InTx(ctx, s.pool, func(tx pgx.Tx) error {
+		q := s.queries.WithTx(tx)
+
+		if _, err := q.DeleteBusinessHoursForScope(ctx, db.DeleteBusinessHoursForScopeParams{
+			ProviderID: providerID,
+			ResourceID: in.ResourceID,
+		}); err != nil {
+			return httpx.Internal(err)
+		}
+
+		for _, span := range in.Hours {
+			row, err := q.CreateBusinessHours(ctx, db.CreateBusinessHoursParams{
+				ProviderID:   providerID,
+				ResourceID:   in.ResourceID,
+				Weekday:      int32(span.Weekday),
+				OpensMinute:  int32(span.Opens),
+				ClosesMinute: int32(span.Closes),
+			})
+			if err != nil {
+				return httpx.Internal(err)
+			}
+
+			rules = append(rules, HoursRule{
+				ID: row.ID, ProviderID: row.ProviderID, ResourceID: row.ResourceID,
+				Weekday: int(row.Weekday),
+				Opens:   TimeOfDay(row.OpensMinute), Closes: TimeOfDay(row.ClosesMinute),
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	s.cache.invalidateProvider(providerID)
+	return rules, nil
+}
+
+// assertNoOverlap refuses two spans on the same weekday that share a minute.
+func assertNoOverlap(spans []HoursInput) error {
+	byDay := make(map[int][]HoursInput, 7)
+	for _, span := range spans {
+		byDay[span.Weekday] = append(byDay[span.Weekday], span)
+	}
+
+	for _, day := range byDay {
+		sort.Slice(day, func(i, j int) bool { return day[i].Opens < day[j].Opens })
+		for i := 1; i < len(day); i++ {
+			if day[i].Opens < day[i-1].Closes {
+				return httpx.Validation("two opening times on the same day overlap")
+			}
+		}
+	}
+	return nil
 }
 
 // UpdateHoursInput patches one weekly opening span.

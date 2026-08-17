@@ -820,15 +820,21 @@ type Provider struct {
 
 	// BookingMode `instant` skips `pending` and confirms at creation; `request` waits for
 	// the provider to approve.
-	BookingMode   BookingMode        `json:"bookingMode"`
-	City          *string            `json:"city,omitempty"`
+	BookingMode BookingMode `json:"bookingMode"`
+	City        *string     `json:"city,omitempty"`
+
+	// CoverUrl The wide banner behind the provider's header.
+	CoverUrl      *string            `json:"coverUrl,omitempty"`
 	CreatedAt     *time.Time         `json:"createdAt,omitempty"`
 	Description   *string            `json:"description,omitempty"`
 	Email         *string            `json:"email,omitempty"`
 	Id            openapi_types.UUID `json:"id"`
 	LicenseNumber *string            `json:"licenseNumber,omitempty"`
 	Location      *Location          `json:"location,omitempty"`
-	LogoUrl       *string            `json:"logoUrl,omitempty"`
+
+	// LogoUrl The square mark. Opaque — relative while uploads are stored
+	// locally, absolute once a hosted provider serves them.
+	LogoUrl *string `json:"logoUrl,omitempty"`
 
 	// MinLeadMinutes Slots sooner than this from now are not offered.
 	MinLeadMinutes *int           `json:"minLeadMinutes,omitempty"`
@@ -862,6 +868,29 @@ type ProviderSummary struct {
 // RefreshRequest defines model for RefreshRequest.
 type RefreshRequest struct {
 	RefreshToken string `json:"refreshToken"`
+}
+
+// ReplaceBusinessHoursRequest defines model for ReplaceBusinessHoursRequest.
+type ReplaceBusinessHoursRequest struct {
+	// Hours Every opening span for the scope. A weekday with no span here is
+	// closed; an empty array closes the scope entirely. More than one span
+	// on a day is a split shift — a lunch break, say — as long as they do
+	// not overlap.
+	Hours []struct {
+		// ClosesAt A wall-clock time in the provider's timezone.
+		//
+		// Example: 09:30
+		ClosesAt TimeOfDay `json:"closesAt"`
+
+		// OpensAt A wall-clock time in the provider's timezone.
+		//
+		// Example: 09:30
+		OpensAt TimeOfDay `json:"opensAt"`
+		Weekday int       `json:"weekday"`
+	} `json:"hours"`
+
+	// ResourceId The scope being rewritten. Null is the provider-wide default.
+	ResourceId *openapi_types.UUID `json:"resourceId,omitempty"`
 }
 
 // Resource defines model for Resource.
@@ -1318,6 +1347,14 @@ type PostApiV1OrgBusinessHoursParams struct {
 	XOrganizationId OrganizationId `json:"x-organization-id"`
 }
 
+// PutApiV1OrgBusinessHoursParams defines parameters for PutApiV1OrgBusinessHours.
+type PutApiV1OrgBusinessHoursParams struct {
+	// XOrganizationId The organization to act within. Client-supplied and never trusted: every
+	// `/org/*` request re-reads the caller's membership from the database
+	// before any org-scoped data is touched.
+	XOrganizationId OrganizationId `json:"x-organization-id"`
+}
+
 // DeleteApiV1OrgBusinessHoursHoursIdParams defines parameters for DeleteApiV1OrgBusinessHoursHoursId.
 type DeleteApiV1OrgBusinessHoursHoursIdParams struct {
 	// XOrganizationId The organization to act within. Client-supplied and never trusted: every
@@ -1445,6 +1482,27 @@ type PatchApiV1OrgProfileParams struct {
 	XOrganizationId OrganizationId `json:"x-organization-id"`
 }
 
+// DeleteApiV1OrgProfileImagesKindParams defines parameters for DeleteApiV1OrgProfileImagesKind.
+type DeleteApiV1OrgProfileImagesKindParams struct {
+	// XOrganizationId The organization to act within. Client-supplied and never trusted: every
+	// `/org/*` request re-reads the caller's membership from the database
+	// before any org-scoped data is touched.
+	XOrganizationId OrganizationId `json:"x-organization-id"`
+}
+
+// PutApiV1OrgProfileImagesKindMultipartBody defines parameters for PutApiV1OrgProfileImagesKind.
+type PutApiV1OrgProfileImagesKindMultipartBody struct {
+	File openapi_types.File `json:"file"`
+}
+
+// PutApiV1OrgProfileImagesKindParams defines parameters for PutApiV1OrgProfileImagesKind.
+type PutApiV1OrgProfileImagesKindParams struct {
+	// XOrganizationId The organization to act within. Client-supplied and never trusted: every
+	// `/org/*` request re-reads the caller's membership from the database
+	// before any org-scoped data is touched.
+	XOrganizationId OrganizationId `json:"x-organization-id"`
+}
+
 // GetApiV1OrgResourcesParams defines parameters for GetApiV1OrgResources.
 type GetApiV1OrgResourcesParams struct {
 	// XOrganizationId The organization to act within. Client-supplied and never trusted: every
@@ -1471,9 +1529,17 @@ type DeleteApiV1OrgResourcesResourceIdParams struct {
 
 // PatchApiV1OrgResourcesResourceIdJSONBody defines parameters for PatchApiV1OrgResourcesResourceId.
 type PatchApiV1OrgResourcesResourceIdJSONBody struct {
-	IsActive *bool               `json:"isActive,omitempty"`
-	Name     *string             `json:"name,omitempty"`
-	UserId   *openapi_types.UUID `json:"userId,omitempty"`
+	IsActive *bool   `json:"isActive,omitempty"`
+	Name     *string `json:"name,omitempty"`
+
+	// UnassignUser Detaches the staff login, leaving the resource nobody's in
+	// particular. Every other field here means "leave it alone"
+	// when omitted, so without this there is no way to say it;
+	// set, it overrides `userId`.
+	UnassignUser *bool `json:"unassignUser,omitempty"`
+
+	// UserId Attaches the resource to a team member's login.
+	UserId *openapi_types.UUID `json:"userId,omitempty"`
 }
 
 // PatchApiV1OrgResourcesResourceIdParams defines parameters for PatchApiV1OrgResourcesResourceId.
@@ -1782,6 +1848,9 @@ type PostApiV1OrgBookingsBookingIdCancelJSONRequestBody PostApiV1OrgBookingsBook
 // PostApiV1OrgBusinessHoursJSONRequestBody defines body for PostApiV1OrgBusinessHours for application/json ContentType.
 type PostApiV1OrgBusinessHoursJSONRequestBody = CreateBusinessHoursRequest
 
+// PutApiV1OrgBusinessHoursJSONRequestBody defines body for PutApiV1OrgBusinessHours for application/json ContentType.
+type PutApiV1OrgBusinessHoursJSONRequestBody = ReplaceBusinessHoursRequest
+
 // PatchApiV1OrgBusinessHoursHoursIdJSONRequestBody defines body for PatchApiV1OrgBusinessHoursHoursId for application/json ContentType.
 type PatchApiV1OrgBusinessHoursHoursIdJSONRequestBody PatchApiV1OrgBusinessHoursHoursIdJSONBody
 
@@ -1796,6 +1865,9 @@ type PatchApiV1OrgMembersUserIdJSONRequestBody PatchApiV1OrgMembersUserIdJSONBod
 
 // PatchApiV1OrgProfileJSONRequestBody defines body for PatchApiV1OrgProfile for application/json ContentType.
 type PatchApiV1OrgProfileJSONRequestBody = UpdateProviderRequest
+
+// PutApiV1OrgProfileImagesKindMultipartRequestBody defines body for PutApiV1OrgProfileImagesKind for multipart/form-data ContentType.
+type PutApiV1OrgProfileImagesKindMultipartRequestBody PutApiV1OrgProfileImagesKindMultipartBody
 
 // PostApiV1OrgResourcesJSONRequestBody defines body for PostApiV1OrgResources for application/json ContentType.
 type PostApiV1OrgResourcesJSONRequestBody = CreateResourceRequest

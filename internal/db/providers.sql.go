@@ -50,7 +50,8 @@ RETURNING
     (location IS NOT NULL)::bool AS has_location,
     COALESCE(ST_X(location::geometry), 0)::float8 AS lng,
     COALESCE(ST_Y(location::geometry), 0)::float8 AS lat,
-    timezone, logo_url, logo_public_id, license_number, status,
+    timezone, logo_url, logo_public_id, cover_url, cover_public_id,
+    license_number, status,
     rating_avg::float8 AS rating_avg, rating_count, booking_mode,
     min_lead_minutes, created_at, updated_at
 `
@@ -86,6 +87,8 @@ type CreateProviderRow struct {
 	Timezone       string
 	LogoUrl        *string
 	LogoPublicID   *string
+	CoverUrl       *string
+	CoverPublicID  *string
 	LicenseNumber  *string
 	Status         string
 	RatingAvg      float64
@@ -131,6 +134,8 @@ func (q *Queries) CreateProvider(ctx context.Context, arg CreateProviderParams) 
 		&i.Timezone,
 		&i.LogoUrl,
 		&i.LogoPublicID,
+		&i.CoverUrl,
+		&i.CoverPublicID,
 		&i.LicenseNumber,
 		&i.Status,
 		&i.RatingAvg,
@@ -149,7 +154,8 @@ SELECT
     (location IS NOT NULL)::bool AS has_location,
     COALESCE(ST_X(location::geometry), 0)::float8 AS lng,
     COALESCE(ST_Y(location::geometry), 0)::float8 AS lat,
-    timezone, logo_url, logo_public_id, license_number, status,
+    timezone, logo_url, logo_public_id, cover_url, cover_public_id,
+    license_number, status,
     rating_avg::float8 AS rating_avg, rating_count, booking_mode,
     min_lead_minutes, created_at, updated_at
 FROM providers
@@ -171,6 +177,8 @@ type GetProviderByIDRow struct {
 	Timezone       string
 	LogoUrl        *string
 	LogoPublicID   *string
+	CoverUrl       *string
+	CoverPublicID  *string
 	LicenseNumber  *string
 	Status         string
 	RatingAvg      float64
@@ -199,6 +207,8 @@ func (q *Queries) GetProviderByID(ctx context.Context, id uuid.UUID) (GetProvide
 		&i.Timezone,
 		&i.LogoUrl,
 		&i.LogoPublicID,
+		&i.CoverUrl,
+		&i.CoverPublicID,
 		&i.LicenseNumber,
 		&i.Status,
 		&i.RatingAvg,
@@ -217,7 +227,8 @@ SELECT
     (location IS NOT NULL)::bool AS has_location,
     COALESCE(ST_X(location::geometry), 0)::float8 AS lng,
     COALESCE(ST_Y(location::geometry), 0)::float8 AS lat,
-    timezone, logo_url, logo_public_id, license_number, status,
+    timezone, logo_url, logo_public_id, cover_url, cover_public_id,
+    license_number, status,
     rating_avg::float8 AS rating_avg, rating_count, booking_mode,
     min_lead_minutes, created_at, updated_at
 FROM providers
@@ -239,6 +250,8 @@ type GetProviderBySlugRow struct {
 	Timezone       string
 	LogoUrl        *string
 	LogoPublicID   *string
+	CoverUrl       *string
+	CoverPublicID  *string
 	LicenseNumber  *string
 	Status         string
 	RatingAvg      float64
@@ -267,6 +280,8 @@ func (q *Queries) GetProviderBySlug(ctx context.Context, slug string) (GetProvid
 		&i.Timezone,
 		&i.LogoUrl,
 		&i.LogoPublicID,
+		&i.CoverUrl,
+		&i.CoverPublicID,
 		&i.LicenseNumber,
 		&i.Status,
 		&i.RatingAvg,
@@ -367,6 +382,54 @@ func (q *Queries) ListProviders(ctx context.Context, arg ListProvidersParams) ([
 	return items, nil
 }
 
+const setProviderCover = `-- name: SetProviderCover :execrows
+UPDATE providers
+SET cover_url       = $1,
+    cover_public_id = $2,
+    updated_at      = now()
+WHERE id = $3
+`
+
+type SetProviderCoverParams struct {
+	CoverUrl      *string
+	CoverPublicID *string
+	ID            uuid.UUID
+}
+
+func (q *Queries) SetProviderCover(ctx context.Context, arg SetProviderCoverParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setProviderCover, arg.CoverUrl, arg.CoverPublicID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setProviderLogo = `-- name: SetProviderLogo :execrows
+
+UPDATE providers
+SET logo_url       = $1,
+    logo_public_id = $2,
+    updated_at     = now()
+WHERE id = $3
+`
+
+type SetProviderLogoParams struct {
+	LogoUrl      *string
+	LogoPublicID *string
+	ID           uuid.UUID
+}
+
+// Branding is written by its own statements rather than through UpdateProvider,
+// which COALESCEs every column and therefore cannot express "remove this".
+// Here a null pair is a deliberate clear, so one query covers set and remove.
+func (q *Queries) SetProviderLogo(ctx context.Context, arg SetProviderLogoParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setProviderLogo, arg.LogoUrl, arg.LogoPublicID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setProviderStatus = `-- name: SetProviderStatus :one
 UPDATE providers
 SET status = $1, updated_at = now()
@@ -445,7 +508,8 @@ RETURNING
     (location IS NOT NULL)::bool AS has_location,
     COALESCE(ST_X(location::geometry), 0)::float8 AS lng,
     COALESCE(ST_Y(location::geometry), 0)::float8 AS lat,
-    timezone, logo_url, logo_public_id, license_number, status,
+    timezone, logo_url, logo_public_id, cover_url, cover_public_id,
+    license_number, status,
     rating_avg::float8 AS rating_avg, rating_count, booking_mode,
     min_lead_minutes, created_at, updated_at
 `
@@ -481,6 +545,8 @@ type UpdateProviderRow struct {
 	Timezone       string
 	LogoUrl        *string
 	LogoPublicID   *string
+	CoverUrl       *string
+	CoverPublicID  *string
 	LicenseNumber  *string
 	Status         string
 	RatingAvg      float64
@@ -523,6 +589,8 @@ func (q *Queries) UpdateProvider(ctx context.Context, arg UpdateProviderParams) 
 		&i.Timezone,
 		&i.LogoUrl,
 		&i.LogoPublicID,
+		&i.CoverUrl,
+		&i.CoverPublicID,
 		&i.LicenseNumber,
 		&i.Status,
 		&i.RatingAvg,

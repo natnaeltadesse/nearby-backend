@@ -134,6 +134,8 @@ type Provider struct {
 	MinLeadMinutes int32
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+	CoverUrl       *string
+	CoverPublicID  *string
 }
 
 type ProviderCategory struct {

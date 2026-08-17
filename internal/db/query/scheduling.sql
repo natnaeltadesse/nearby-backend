@@ -30,7 +30,13 @@ ORDER BY r.name;
 -- name: UpdateResource :one
 UPDATE resources
 SET name       = COALESCE(sqlc.narg(name), name),
-    user_id    = COALESCE(sqlc.narg(user_id), user_id),
+    -- COALESCE alone can never write a NULL back, so "this chair is nobody's
+    -- again" would be unsayable: reassigning works, unassigning does not.
+    -- @unassign_user is that missing half.
+    user_id    = CASE
+                     WHEN @unassign_user::bool THEN NULL
+                     ELSE COALESCE(sqlc.narg(user_id), user_id)
+                 END,
     is_active  = COALESCE(sqlc.narg(is_active), is_active),
     updated_at = now()
 WHERE id = @id AND provider_id = @provider_id
@@ -100,6 +106,15 @@ RETURNING id, provider_id, resource_id, weekday,
 
 -- name: DeleteBusinessHours :execrows
 DELETE FROM business_hours WHERE id = @id AND provider_id = @provider_id;
+
+-- Clears one scope so the whole week can be rewritten in a transaction, which
+-- is what an hours editor actually does: it saves a week, not a row. A null
+-- resource_id is its own scope, so replacing the provider-wide default leaves
+-- per-resource overrides alone.
+-- name: DeleteBusinessHoursForScope :execrows
+DELETE FROM business_hours
+WHERE provider_id = @provider_id
+  AND resource_id IS NOT DISTINCT FROM sqlc.narg(resource_id);
 
 -- ---------------------------------------------------------------- exceptions
 

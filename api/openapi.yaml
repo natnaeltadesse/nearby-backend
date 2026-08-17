@@ -689,6 +689,62 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "422": { $ref: "#/components/responses/ValidationError" }
 
+  /api/v1/org/profile/images/{kind}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - name: kind
+        in: path
+        required: true
+        description: Which of the two pictures to write.
+        schema: { type: string, enum: [logo, cover] }
+    put:
+      tags: [org]
+      summary: Replace the logo or the cover
+      description: |
+        Requires the `admin` or `owner` role. `multipart/form-data` with a
+        `file` part.
+
+        A provider has exactly one of each picture, so this replaces rather
+        than appends — hence `PUT` and no image id. The bytes that were there
+        before are deleted once the column has moved.
+
+        The image type is sniffed from the content, never taken from the
+        request. JPEG, PNG, WebP and GIF are accepted; SVG deliberately is not,
+        because it can carry script and would be served from this API's own
+        origin. 5 MB per image.
+
+        The whole provider comes back rather than just the new URL, so a client
+        showing a profile does not need a second request to see the change.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        "200":
+          description: The updated provider.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    delete:
+      tags: [org]
+      summary: Remove the logo or the cover
+      description: Requires the `admin` or `owner` role. The stored file goes too.
+      responses:
+        "200":
+          description: The updated provider.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /api/v1/org/services:
     get:
       tags: [org]
@@ -978,7 +1034,18 @@ paths:
               type: object
               properties:
                 name: { type: string }
-                userId: { type: string, format: uuid, nullable: true }
+                userId:
+                  type: string
+                  format: uuid
+                  nullable: true
+                  description: Attaches the resource to a team member's login.
+                unassignUser:
+                  type: boolean
+                  description: |
+                    Detaches the staff login, leaving the resource nobody's in
+                    particular. Every other field here means "leave it alone"
+                    when omitted, so without this there is no way to say it;
+                    set, it overrides `userId`.
                 isActive: { type: boolean }
       responses:
         "200":
@@ -1050,6 +1117,41 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/BusinessHours" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    put:
+      tags: [org]
+      summary: Replace a scope's whole weekly pattern
+      description: |
+        Requires the `admin` or `owner` role.
+
+        What an hours editor actually saves is a week, not a row. Doing that as
+        a stream of creates and deletes would leave the schedule visibly wrong
+        in between — a customer refreshing mid-save could find the business shut
+        all week — so the delete and the inserts share one transaction.
+
+        Only the scope named by `resourceId` is rewritten. A null `resourceId`
+        is the provider-wide default, so saving the business's week leaves any
+        per-resource overrides alone.
+
+        Two spans on the same weekday may not overlap; the database has no
+        constraint for that, so it is checked here.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReplaceBusinessHoursRequest" }
+      responses:
+        "200":
+          description: The scope's new weekly pattern.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  businessHours:
+                    type: array
+                    items: { $ref: "#/components/schemas/BusinessHours" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "422": { $ref: "#/components/responses/ValidationError" }
 
   /api/v1/org/business-hours/{hoursId}:
@@ -2272,7 +2374,16 @@ components:
           type: string
           description: IANA zone; all slot maths happens here.
           example: Africa/Addis_Ababa
-        logoUrl: { type: string, nullable: true }
+        logoUrl:
+          type: string
+          nullable: true
+          description: |
+            The square mark. Opaque — relative while uploads are stored
+            locally, absolute once a hosted provider serves them.
+        coverUrl:
+          type: string
+          nullable: true
+          description: The wide banner behind the provider's header.
         licenseNumber: { type: string, nullable: true }
         status: { $ref: "#/components/schemas/ProviderStatus" }
         ratingAvg: { type: number, format: double }
@@ -2580,6 +2691,30 @@ components:
         weekday: { type: integer, minimum: 0, maximum: 6 }
         opensAt: { $ref: "#/components/schemas/TimeOfDay" }
         closesAt: { $ref: "#/components/schemas/TimeOfDay" }
+
+    ReplaceBusinessHoursRequest:
+      type: object
+      required: [hours]
+      properties:
+        resourceId:
+          type: string
+          format: uuid
+          nullable: true
+          description: The scope being rewritten. Null is the provider-wide default.
+        hours:
+          type: array
+          description: |
+            Every opening span for the scope. A weekday with no span here is
+            closed; an empty array closes the scope entirely. More than one span
+            on a day is a split shift — a lunch break, say — as long as they do
+            not overlap.
+          items:
+            type: object
+            required: [weekday, opensAt, closesAt]
+            properties:
+              weekday: { type: integer, minimum: 0, maximum: 6 }
+              opensAt: { $ref: "#/components/schemas/TimeOfDay" }
+              closesAt: { $ref: "#/components/schemas/TimeOfDay" }
 
     ScheduleException:
       type: object

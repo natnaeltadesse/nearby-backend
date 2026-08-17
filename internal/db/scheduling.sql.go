@@ -190,6 +190,29 @@ func (q *Queries) DeleteBusinessHours(ctx context.Context, arg DeleteBusinessHou
 	return result.RowsAffected(), nil
 }
 
+const deleteBusinessHoursForScope = `-- name: DeleteBusinessHoursForScope :execrows
+DELETE FROM business_hours
+WHERE provider_id = $1
+  AND resource_id IS NOT DISTINCT FROM $2
+`
+
+type DeleteBusinessHoursForScopeParams struct {
+	ProviderID uuid.UUID
+	ResourceID *uuid.UUID
+}
+
+// Clears one scope so the whole week can be rewritten in a transaction, which
+// is what an hours editor actually does: it saves a week, not a row. A null
+// resource_id is its own scope, so replacing the provider-wide default leaves
+// per-resource overrides alone.
+func (q *Queries) DeleteBusinessHoursForScope(ctx context.Context, arg DeleteBusinessHoursForScopeParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteBusinessHoursForScope, arg.ProviderID, arg.ResourceID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteResource = `-- name: DeleteResource :execrows
 DELETE FROM resources WHERE id = $1 AND provider_id = $2
 `
@@ -635,24 +658,32 @@ func (q *Queries) UpdateBusinessHours(ctx context.Context, arg UpdateBusinessHou
 const updateResource = `-- name: UpdateResource :one
 UPDATE resources
 SET name       = COALESCE($1, name),
-    user_id    = COALESCE($2, user_id),
-    is_active  = COALESCE($3, is_active),
+    -- COALESCE alone can never write a NULL back, so "this chair is nobody's
+    -- again" would be unsayable: reassigning works, unassigning does not.
+    -- @unassign_user is that missing half.
+    user_id    = CASE
+                     WHEN $2::bool THEN NULL
+                     ELSE COALESCE($3, user_id)
+                 END,
+    is_active  = COALESCE($4, is_active),
     updated_at = now()
-WHERE id = $4 AND provider_id = $5
+WHERE id = $5 AND provider_id = $6
 RETURNING id, provider_id, name, user_id, is_active, created_at, updated_at
 `
 
 type UpdateResourceParams struct {
-	Name       *string
-	UserID     *uuid.UUID
-	IsActive   *bool
-	ID         uuid.UUID
-	ProviderID uuid.UUID
+	Name         *string
+	UnassignUser bool
+	UserID       *uuid.UUID
+	IsActive     *bool
+	ID           uuid.UUID
+	ProviderID   uuid.UUID
 }
 
 func (q *Queries) UpdateResource(ctx context.Context, arg UpdateResourceParams) (Resource, error) {
 	row := q.db.QueryRow(ctx, updateResource,
 		arg.Name,
+		arg.UnassignUser,
 		arg.UserID,
 		arg.IsActive,
 		arg.ID,

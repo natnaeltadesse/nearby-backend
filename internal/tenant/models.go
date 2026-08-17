@@ -47,6 +47,7 @@ type Provider struct {
 	Location       *Location `json:"location,omitempty"`
 	Timezone       string    `json:"timezone"`
 	LogoURL        *string   `json:"logoUrl,omitempty"`
+	CoverURL       *string   `json:"coverUrl,omitempty"`
 	LicenseNumber  *string   `json:"licenseNumber,omitempty"`
 	Status         string    `json:"status"`
 	RatingAvg      float64   `json:"ratingAvg"`

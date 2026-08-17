@@ -59,6 +59,11 @@ type Querier interface {
 	CreateUser(ctx context.Context, arg CreateUserParams) (CreateUserRow, error)
 	CreateVerificationCode(ctx context.Context, arg CreateVerificationCodeParams) (CreateVerificationCodeRow, error)
 	DeleteBusinessHours(ctx context.Context, arg DeleteBusinessHoursParams) (int64, error)
+	// Clears one scope so the whole week can be rewritten in a transaction, which
+	// is what an hours editor actually does: it saves a week, not a row. A null
+	// resource_id is its own scope, so replacing the provider-wide default leaves
+	// per-resource overrides alone.
+	DeleteBusinessHoursForScope(ctx context.Context, arg DeleteBusinessHoursForScopeParams) (int64, error)
 	DeleteCategory(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteCategoryAttribute(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteExpiredRefreshTokens(ctx context.Context) (int64, error)
@@ -172,6 +177,11 @@ type Querier interface {
 	// the client draws starts from the truth rather than from zero.
 	ServicesAddedByMonth(ctx context.Context, arg ServicesAddedByMonthParams) ([]ServicesAddedByMonthRow, error)
 	ServicesCreatedBefore(ctx context.Context, arg ServicesCreatedBeforeParams) (int64, error)
+	SetProviderCover(ctx context.Context, arg SetProviderCoverParams) (int64, error)
+	// Branding is written by its own statements rather than through UpdateProvider,
+	// which COALESCEs every column and therefore cannot express "remove this".
+	// Here a null pair is a deliberate clear, so one query covers set and remove.
+	SetProviderLogo(ctx context.Context, arg SetProviderLogoParams) (int64, error)
 	SetProviderStatus(ctx context.Context, arg SetProviderStatusParams) (SetProviderStatusRow, error)
 	SetServiceImage(ctx context.Context, arg SetServiceImageParams) (SetServiceImageRow, error)
 	SetUserFCMToken(ctx context.Context, arg SetUserFCMTokenParams) error

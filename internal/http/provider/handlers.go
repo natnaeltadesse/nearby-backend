@@ -64,6 +64,11 @@ func (h *Handler) Routes() chi.Router {
 	r.Get("/profile", httpx.H(h.getProfile))
 	r.With(manage).Patch("/profile", httpx.H(h.updateProfile))
 
+	// The logo and the cover are one picture each, so they are replaced rather
+	// than appended to — PUT, not POST, and no id in the path.
+	r.With(manage).Put("/profile/images/{kind}", httpx.H(h.uploadBranding))
+	r.With(manage).Delete("/profile/images/{kind}", httpx.H(h.deleteBranding))
+
 	r.Route("/services", func(r chi.Router) {
 		r.Get("/", httpx.H(h.listServices))
 		r.With(manage).Post("/", httpx.H(h.createService))
@@ -104,6 +109,7 @@ func (h *Handler) Routes() chi.Router {
 	r.Route("/business-hours", func(r chi.Router) {
 		r.Get("/", httpx.H(h.listHours))
 		r.With(manage).Post("/", httpx.H(h.createHours))
+		r.With(manage).Put("/", httpx.H(h.replaceHours))
 		r.With(manage).Patch("/{hoursID}", httpx.H(h.updateHours))
 		r.With(manage).Delete("/{hoursID}", httpx.H(h.deleteHours))
 	})
@@ -184,6 +190,79 @@ func (h *Handler) updateProfile(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	httpx.JSON(w, r, http.StatusOK, updated)
+	return nil
+}
+
+// uploadBranding replaces the logo or the cover with one uploaded image.
+//
+// The response is the whole provider rather than just the new URL: the caller
+// is showing a profile, and handing back the object it already renders saves it
+// a second request to see the change.
+func (h *Handler) uploadBranding(w http.ResponseWriter, r *http.Request) error {
+	org, err := tenant.MustOrg(r.Context())
+	if err != nil {
+		return err
+	}
+
+	kind, err := media.ParseKind(chi.URLParam(r, "kind"))
+	if err != nil {
+		return err
+	}
+
+	// Capped before parsing, not after: an oversized body then fails at the
+	// socket rather than once the server has already buffered all of it.
+	r.Body = http.MaxBytesReader(w, r.Body, media.MaxImageBytes+1024)
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return httpx.Validation("That image is larger than 5 MB")
+		}
+		return httpx.Validation("Attach the image as a `file` field")
+	}
+	defer func() { _ = file.Close() }()
+
+	data, err := media.ReadLimited(file)
+	if err != nil {
+		return httpx.Validation("That image is larger than 5 MB")
+	}
+
+	if _, err := h.media.SetProviderImage(
+		r.Context(), org.ProviderID, kind, header.Filename, data); err != nil {
+		return err
+	}
+
+	provider, err := h.tenant.GetProvider(r.Context(), org.ProviderID)
+	if err != nil {
+		return err
+	}
+
+	httpx.JSON(w, r, http.StatusOK, provider)
+	return nil
+}
+
+func (h *Handler) deleteBranding(w http.ResponseWriter, r *http.Request) error {
+	org, err := tenant.MustOrg(r.Context())
+	if err != nil {
+		return err
+	}
+
+	kind, err := media.ParseKind(chi.URLParam(r, "kind"))
+	if err != nil {
+		return err
+	}
+
+	if err := h.media.ClearProviderImage(r.Context(), org.ProviderID, kind); err != nil {
+		return err
+	}
+
+	provider, err := h.tenant.GetProvider(r.Context(), org.ProviderID)
+	if err != nil {
+		return err
+	}
+
+	httpx.JSON(w, r, http.StatusOK, provider)
 	return nil
 }
 
@@ -589,6 +668,29 @@ func (h *Handler) createHours(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	httpx.JSON(w, r, http.StatusCreated, created)
+	return nil
+}
+
+// replaceHours saves a whole week at once, which is what an hours editor
+// actually produces. The per-row POST/PATCH/DELETE below remain for callers
+// that really are changing one span.
+func (h *Handler) replaceHours(w http.ResponseWriter, r *http.Request) error {
+	org, err := tenant.MustOrg(r.Context())
+	if err != nil {
+		return err
+	}
+
+	var in scheduling.ReplaceHoursInput
+	if err := httpx.Decode(r, &in); err != nil {
+		return err
+	}
+
+	hours, err := h.scheduler.ReplaceHours(r.Context(), org.ProviderID, in)
+	if err != nil {
+		return err
+	}
+
+	httpx.JSON(w, r, http.StatusOK, map[string]any{"businessHours": hours})
 	return nil
 }
 
